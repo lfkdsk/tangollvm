@@ -16,6 +16,7 @@
 #include "X86InstrInfo.h"
 #include "X86Subtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -2893,7 +2894,8 @@ void X86GoStatepointFixup::collectUntrackedPointers(DenseMap<Register, SmallVect
   // NOTE: Only track virtual registers.
   DenseMap<MachineBasicBlock*, SmallSetVector<Register, 8>> LiveInValues;
 
-  DenseMap<MachineInstr*, SmallSetVector<Register, 8>> StatepointLiveOutValues;
+  // Visit statepoints in discovery order when assigning virtual registers.
+  MapVector<MachineInstr *, SmallSetVector<Register, 8>> StatepointLiveOutValues;
 
   std::deque<MachineBasicBlock*> Worklist;
   BitVector InList(MF->getNumBlockIDs());
