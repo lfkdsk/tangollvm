@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
       if (Source.first != Module)
         Sources.push_back(Source.first);
     Plan.push_back(json::Object{{"module", Module},
-                                {"index", Path.str()},
+                                {"index", Path.str().str()},
                                 {"sources", std::move(Sources)},
                                 {"functions", Functions}});
   }
