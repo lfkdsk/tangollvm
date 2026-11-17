@@ -50,9 +50,12 @@ func thinSummary(path, work string, occurrences map[string]int) (string, error) 
 		}
 		defer os.Remove(tmp.Name())
 		h := sha256.New()
-		_, err = io.Copy(io.MultiWriter(tmp, h), io.NewSectionReader(f, entry.Offset, entry.Size))
+		size, err := io.Copy(io.MultiWriter(tmp, h), io.NewSectionReader(f, entry.Offset, entry.Size))
 		if err := errors.Join(err, tmp.Close()); err != nil {
 			return "", err
+		}
+		if size != entry.Size {
+			return "", io.ErrUnexpectedEOF
 		}
 		digest := fmt.Sprintf("%x", h.Sum(nil))
 		name := fmt.Sprintf("%s-%d.bc", digest, occurrences[digest])
@@ -111,6 +114,9 @@ func thinCacheDir() string {
 }
 
 func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) ([]string, error) {
+	if workers < 1 || memory < 1 {
+		return nil, fmt.Errorf("ThinLTO backend limits must be positive")
+	}
 	work, err := os.MkdirTemp(t.dir, "tangollvm-thin-")
 	if err != nil {
 		return nil, err
@@ -186,7 +192,7 @@ func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) 
 	}
 
 	// Reserve an estimated 512 MiB per worker. Individual backends may exceed
-	// that estimate, so this controls admission rather than enforcing RSS.
+	// that estimate. The budget controls admission.
 	workers = min(workers, len(modules), max(1, memory/512))
 	outputs := make([]string, len(modules))
 	hits := make([]bool, len(modules))
