@@ -1058,7 +1058,9 @@ bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
             switch (MI.getOpcode()) {
             case X86::ADD64rr:
               // RSP is legal as an LEA base, but never as its index.
-              if (MI.getOperand(2).getReg() == Op.Dst)
+              // Another copy may already have been substituted into operand 2.
+              if (MI.getOperand(2).getReg() == Op.Dst ||
+                  MI.getOperand(2).getReg() == Op.Src)
                 continue;
               break;
             case X86::ADD64ri32:
