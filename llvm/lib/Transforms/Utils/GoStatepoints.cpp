@@ -1667,16 +1667,23 @@ zeroAmbiguouslyLiveSlots(Function &F, DenseMap<Value *, ToZeroInfo> &ToZero) {
   Type *PtrPtrIntTy = PtrIntTy->getPointerTo();
   Type *IdxTy = PtrIntTy;
 
-  for (auto &It : ToZero) {
-    Instruction *SO = cast<Instruction>(It.first);
+  // Several slots can share an insertion point. Process them in entry-block
+  // order so their relative order is independent of instruction addresses.
+  SmallVector<Instruction *> Slots;
+  for (Instruction &I : F.getEntryBlock())
+    if (ToZero.count(&I))
+      Slots.push_back(&I);
+
+  for (Instruction *SO : Slots) {
+    ToZeroInfo &Info = ToZero.find(SO)->second;
     Instruction *Pos;
-    if (OptToZeroPosition == false || It.second.Pos == nullptr
+    if (OptToZeroPosition == false || Info.Pos == nullptr
         || SO->hasMetadata("go.alwayslive")) {
       Pos = SO->getNextNode();
     } else {
-      Pos = It.second.Pos->getFirstNonPHI();
+      Pos = Info.Pos->getFirstNonPHI();
     }
-    BitVector &State = It.second.State;
+    BitVector &State = Info.State;
     assert(SO->getParent() == &F.getEntryBlock() && "all stack objects are allocated in entry block in Go");
 
     IRBuilder<> Builder(Pos);
