@@ -151,6 +151,10 @@ if(TARGET llvm-lto)
   set(LLVM_TEST_DEPENDS ${LLVM_TEST_DEPENDS} llvm-lto)
 endif()
 
+if(TARGET tango-thinlto-plan)
+  set(LLVM_TEST_DEPENDS ${LLVM_TEST_DEPENDS} tango-thinlto-plan)
+endif()
+
 if(TARGET llvm-driver)
   set(LLVM_TEST_DEPENDS ${LLVM_TEST_DEPENDS} llvm-driver)
 endif()
