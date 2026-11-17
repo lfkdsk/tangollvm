@@ -3194,61 +3194,63 @@ static bool legalizeTangoLLVMIR(Function &F, DomTreeUpdater *DTU) {
   {
     // sanity check
     MDNode *MD = F.getMetadata("go.callee.args.area");
-    if (MD == nullptr) {
-      // TODO: this may happen if we fail to lower a llvm.memmove to instructions
-      // We should ensure that all memmove from OpMove must be lowered to memcpy.inline.
-      if (ComputedCalleeAreaSize != 0)
-        report_fatal_error("bad callee args area: should be zero");
-    } else {
-      int64_t CalleeArgAreaSize = dyn_cast<ConstantAsMetadata>(MD->getOperand(0))
-                                      ->getValue()->getUniqueInteger().getSExtValue();
-      if (ComputedCalleeAreaSize > CalleeArgAreaSize) {
-        bool HasOtherCall = false;
-        bool HasGoPanicBounds = false;
-        bool HasMemmove = false;
-        bool HasMemclr = false;
-        for (Instruction &I : instructions(F)) {
-          if (CallInst *CI = dyn_cast<CallInst>(&I)) {
-            if (CI->getIntrinsicID() != 0)
+    // The frontend only emits go.callee.args.area when a Go-level call needs
+    // an outgoing argument area. A missing node therefore means a zero-size
+    // area, not that no call may exist: optimization can regenerate memory
+    // intrinsics (e.g. a large struct copy lowered by SROA/memcpyopt back to
+    // llvm.memmove), which convertIntrinsicsToCalls turns into runtime.memmove
+    // / runtime.memclrNoHeapPointers calls whose area the frontend never saw.
+    int64_t CalleeArgAreaSize = 0;
+    if (MD != nullptr) {
+      CalleeArgAreaSize = dyn_cast<ConstantAsMetadata>(MD->getOperand(0))
+                              ->getValue()->getUniqueInteger().getSExtValue();
+    }
+    if (ComputedCalleeAreaSize > CalleeArgAreaSize) {
+      bool HasOtherCall = false;
+      bool HasGoPanicBounds = false;
+      bool HasMemmove = false;
+      bool HasMemclr = false;
+      for (Instruction &I : instructions(F)) {
+        if (CallInst *CI = dyn_cast<CallInst>(&I)) {
+          if (CI->getIntrinsicID() != 0)
+            continue;
+          if (Function *Callee = CI->getCalledFunction()) {
+            if (Callee->getName() == "runtime.memmove") {
+              HasMemmove = true;
               continue;
-            if (Function *Callee = CI->getCalledFunction()) {
-              if (Callee->getName() == "runtime.memmove") {
-                HasMemmove = true;
-                continue;
-              } else if (Callee->getName() == "runtime.memclrNoHeapPointers") {
-                HasMemclr = true;
-                continue;
-              } else if (TangoLLVM::isGoPanicBounds(Callee->getName())) {
-                HasGoPanicBounds = true;
-                continue;
-              } else {
-                HasOtherCall = true;
-              }
+            } else if (Callee->getName() == "runtime.memclrNoHeapPointers") {
+              HasMemclr = true;
+              continue;
+            } else if (TangoLLVM::isGoPanicBounds(Callee->getName())) {
+              HasGoPanicBounds = true;
+              continue;
+            } else {
+              HasOtherCall = true;
             }
           }
         }
-        bool ReportFailure = HasOtherCall;
-        if (ReportFailure) {
-          // 24 is the space for memmove
-          if (HasMemmove && ComputedCalleeAreaSize == 24) {
-            ReportFailure = false;
-          } else if (HasMemclr && ComputedCalleeAreaSize == 16) {
-            ReportFailure = false;
-          }
+      }
+      bool ReportFailure = HasOtherCall;
+      if (ReportFailure) {
+        // 24 is the space for memmove
+        if (HasMemmove && ComputedCalleeAreaSize == 24) {
+          ReportFailure = false;
+        } else if (HasMemclr && ComputedCalleeAreaSize == 16) {
+          ReportFailure = false;
         }
-        if (ReportFailure) {
+      }
+      if (ReportFailure) {
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-          F.dump();
+        F.dump();
 #endif
-          dbgs() << F.getName() << ": bad callee args size: " << ComputedCalleeAreaSize << " vs. " << CalleeArgAreaSize << "\n";
-          report_fatal_error("bad callee args area");
-        } else {
-          if (HasGoPanicBounds && ComputedCalleeAreaSize < 16) {
-            report_fatal_error("bad callee args area: must be at least 16 for panic bounds");
-          }
-          // We need to update the callee size
-          TangoLLVM::updateGoCalleeAreaSize(F, ComputedCalleeAreaSize);
+        dbgs() << F.getName() << ": bad callee args size: " << ComputedCalleeAreaSize << " vs. " << CalleeArgAreaSize << "\n";
+        report_fatal_error("bad callee args area");
+      } else {
+        if (HasGoPanicBounds && ComputedCalleeAreaSize < 16) {
+          report_fatal_error("bad callee args area: must be at least 16 for panic bounds");
         }
+        // We need to update the callee size
+        TangoLLVM::updateGoCalleeAreaSize(F, ComputedCalleeAreaSize);
       }
     }
   }
