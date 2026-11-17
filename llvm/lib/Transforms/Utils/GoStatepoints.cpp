@@ -29,6 +29,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -119,8 +120,8 @@ struct GoStatepoints : public PassInfoMixin<GoStatepoints> {
 
 } // namespace llvm
 
-// STATISTIC(NumGCToZero, "Number of ToZero stores");
-static int NumGCToZero = 0;
+STATISTIC(NumGCToZero, "Number of ToZero objects");
+STATISTIC(NumGCToZeroBytes, "Number of bytes stored by ToZero");
 
 // Print the ToZero found at the insert location
 static cl::opt<bool> PrintToZero("gogc-print-tozero", cl::Hidden,
@@ -1700,16 +1701,23 @@ zeroAmbiguouslyLiveSlots(Function &F, DenseMap<Value *, ToZeroInfo> &ToZero) {
         if (PrintToZero)
           dbgs() << "Zeroing: " << *Zeroing << " (offset=" << I * PtrSize << ") for " << I << "\n";
 
+        NumGCToZeroBytes += PtrSize;
         I = State.find_next(I);
       }
     } else {
       Value *Zero = Constant::getNullValue(ElemTyp);
       // volatile
       auto * Zeroing = Builder.CreateStore(Zero, Dst, true);
+      NumGCToZeroBytes += DL.getTypeStoreSize(ElemTyp).getFixedValue();
       if (PrintToZero)
         dbgs() << "Zeroing: " << *Zeroing << "\n";
     }
 
+    if (PrintToZero)
+      dbgs() << "GO-GC-STATS tozero " << F.getName() << " "
+             << ((OptToZeroPattern && BitsSet <= 4 && BitsAll - BitsSet >= 4)
+                     ? BitsSet * PtrSize
+                     : DL.getTypeStoreSize(ElemTyp).getFixedValue()) << "\n";
     ++NumGCToZero;
     ToZero.erase(SO);
   }
