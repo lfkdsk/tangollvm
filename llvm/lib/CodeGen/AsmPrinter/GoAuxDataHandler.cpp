@@ -32,6 +32,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCFragment.h"
 #include "llvm/MC/MCObjectFileInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/EndianStream.h"
@@ -1165,8 +1166,24 @@ void MCGoAuxData::emitPCData(std::vector<PCData> &list, std::string &symbol) {
   int32_t PrevValue = -1;
   for (auto &D : list) {
     int64_t ValueDelta = D.Value - PrevValue;
-    const MCExpr *AddrDelta = buildSymbolDiff(Asm->OutContext, D.PC, PrevPC);
-    Asm->OutStreamer->emitGoPCDataEntry(ValueDelta, AddrDelta);
+    // Offsets within one fixed x86 data fragment move together during layout.
+    // Encode that pair now, avoiding a relaxation fragment and three MCExprs.
+    const MCFragment *Frag = D.PC->getFragment();
+    if (Asm->OutStreamer->getAssemblerPtr() &&
+        Asm->OutContext.getTargetTriple().isX86() && Frag &&
+        Frag->getKind() == MCFragment::FT_Data && Frag == PrevPC->getFragment() &&
+        !D.PC->isVariable() && !PrevPC->isVariable() &&
+        D.PC->getOffset() >= PrevPC->getOffset()) {
+      uint64_t Delta = D.PC->getOffset() - PrevPC->getOffset();
+      if (Delta) {
+        uint64_t ZigZag = (uint64_t(ValueDelta) << 1) ^ uint64_t(-(ValueDelta < 0));
+        Asm->OutStreamer->emitULEB128IntValue(ZigZag);
+        Asm->OutStreamer->emitULEB128IntValue(Delta);
+      }
+    } else {
+      const MCExpr *AddrDelta = buildSymbolDiff(Asm->OutContext, D.PC, PrevPC);
+      Asm->OutStreamer->emitGoPCDataEntry(ValueDelta, AddrDelta);
+    }
     PrevPC = D.PC;
     PrevValue = D.Value;
   }
