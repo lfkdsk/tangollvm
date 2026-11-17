@@ -838,6 +838,18 @@ bool RemoveRedundantCopy::replace(MachineInstr &MI) {
       if (MO.isDef()) {
         report_fatal_error("cannot define in function body");
       }
+      // The generic two-address pass expects virtual tied inputs and can
+      // commute an untied input into that position. Keep all register inputs
+      // virtual until the ties have been removed (e.g. by conversion to LEA).
+      bool HasTiedUse = false;
+      for (const MachineOperand &Use : MI.operands())
+        if (Use.isReg() && Use.isUse() &&
+            MI.isRegTiedToDefOperand(Use.getOperandNo())) {
+          HasTiedUse = true;
+          break;
+        }
+      if (HasTiedUse)
+        continue;
       // In particular, an LEA index cannot be RSP. Keep the virtual copy
       // for uses whose operand constraints do not admit the physical register.
       const MachineFunction &MF = *MI.getMF();
@@ -1063,14 +1075,15 @@ bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
                   MI.getOperand(2).getReg() == Op.Src)
                 continue;
               break;
+            case X86::ADD64ri8:
             case X86::ADD64ri32:
+            case X86::SUB64ri8:
             case X86::SUB64ri32:
             case X86::INC64r:
               break;
             default:
               // Keep a virtual copy for tied operations without a supported
-              // three-address form. This includes short-immediate opcodes:
-              // convertToThreeAddress only accepts their full-width forms.
+              // three-address form.
               // Substituting RSP would tie the result to RSP as well.
               continue;
             }
