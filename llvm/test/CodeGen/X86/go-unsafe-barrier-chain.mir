@@ -1,3 +1,5 @@
+# RUN: sed 's/"go-leaf"="true"/"go.allunsafe"="nosplit" "go-leaf"="true"/' %s | llc -x=mir -start-after=prologepilog -filetype=obj -go-debug-unsafe-point -o %t.leaf.o 2>&1 | FileCheck %s --check-prefix=LEAF
+# LEAF: GO-GC-STATS allunsafe probe
 # RUN: llc -start-after=prologepilog -filetype=obj -go-debug-unsafe-point %s -o %t.o 2>&1 | FileCheck %s
 # RUN: sed 's/@runtime.writeBarrier, /@runtime.writeBarrier + 4, /' %s | llc -x=mir -start-after=prologepilog -filetype=obj -go-debug-unsafe-point -o %t.fallback.o 2>&1 | FileCheck %s --check-prefix=FALLBACK
 # REQUIRES: x86-registered-target
