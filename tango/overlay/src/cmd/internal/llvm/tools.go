@@ -176,12 +176,12 @@ func ltoInputs(archives []string) ([]string, error) {
 	return inputs, nil
 }
 
-func (t *Tools) RunLTO(archives []string) {
+func (t *Tools) RunLTO(archives []string) ([]string, error) {
 	output, err := t.runLTO(archives)
 	if err != nil {
-		log.Fatalf("LLVM LTO failed: %v", err)
+		return nil, err
 	}
-	os.Setenv("LTO_BIN", output)
+	return []string{output}, nil
 }
 
 func (t *Tools) runLTO(archives []string) (string, error) {
