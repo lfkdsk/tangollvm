@@ -899,6 +899,11 @@ GlobalVariable* GORoDataInitializerPass::materializeROInit(GlobalVariable &G, Mo
 
   auto R = data.relocs;
   auto &DL = M.getDataLayout();
+  // Go's symbol data may omit implicit trailing zeros. A shorter
+  // materialized object would make loads from that tail out of bounds.
+  if (Bytes.size() < DL.getTypeAllocSize(G.getValueType()))
+    return nullptr;
+
   if (R.empty() && isa<StructType>(G.getValueType())) {
       LLVMContext &C = M.getContext();
       Type *T = G.getValueType();
@@ -998,6 +1003,17 @@ PreservedAnalyses GORoDataInitializerPass::run(Module &M, ModuleAnalysisManager 
     }
     std::string OldName = GV.getName().str();
     GV.setName(OldName + ".old");
+    // The renamed symbol has no IR users until GORoDataRestorePass re-points
+    // the alias at it. Go-aware GlobalDCE and GlobalOpt only keep external Go
+    // declarations that carry go.global; without this marker they would erase
+    // the ".old" declaration mid-pipeline and the restore pass could no
+    // longer find it. go.rodata.keepold records that we added go.global here
+    // so the restore pass can remove both once the pair is undone.
+    if (!GV.hasMetadata("go.global")) {
+      LLVMContext &Ctx = M.getContext();
+      GV.setMetadata("go.global", MDNode::get(Ctx, {}));
+      GV.setMetadata("go.rodata.keepold", MDNode::get(Ctx, {}));
+    }
     auto *Aliasee = ConstantExpr::getBitCast(NG, PointerType::get(GV.getValueType(), GV.getAddressSpace()));
     auto *GA = GlobalAlias::create(
         GV.getValueType(), /*addrspace=*/GV.getAddressSpace(), GlobalValue::ExternalLinkage,
@@ -1031,6 +1047,13 @@ PreservedAnalyses GORoDataRestorePass::run(Module &M, ModuleAnalysisManager &) {
       Old->setLinkage(GlobalValue::ExternalLinkage);
       Old->setInitializer(nullptr);
       Old->setConstant(false);
+      // Drop the temporary liveness markers installed by
+      // GORoDataInitializerPass so later passes see the original declaration.
+      if (Old->hasMetadata("go.rodata.keepold")) {
+        LLVMContext &Ctx = Old->getContext();
+        Old->eraseMetadata(Ctx.getMDKindID("go.rodata.keepold"));
+        Old->eraseMetadata(Ctx.getMDKindID("go.global"));
+      }
     }
 
     GA->replaceAllUsesWith(Rest);
