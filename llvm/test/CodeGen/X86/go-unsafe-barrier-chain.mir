@@ -1,0 +1,65 @@
+# RUN: llc -start-after=prologepilog -filetype=obj -go-debug-unsafe-point %s -o %t.o 2>&1 | FileCheck %s
+# RUN: sed 's/@runtime.writeBarrier, /@runtime.writeBarrier + 4, /' %s | llc -x=mir -start-after=prologepilog -filetype=obj -go-debug-unsafe-point -o %t.fallback.o 2>&1 | FileCheck %s --check-prefix=FALLBACK
+# REQUIRES: x86-registered-target
+#
+# The check and gcWriteBarrier call are separated by three blocks. The
+# stack store in bb.2 is inside the protected interval even though neither
+# the one-block backward search nor the direct-successor check reaches it.
+# CHECK: GO-GC-STATS unsafe-block probe 2 1 1
+# FALLBACK: Go unsafe-point barrier fallback: probe
+# FALLBACK: GO-GC-STATS allunsafe probe
+#
+--- |
+  target triple = "x86_64-unknown-linux-goabi"
+  @runtime.writeBarrier = external global i32
+  declare cc 113 ptr @runtime.gcWriteBarrier2()
+  define cc 113 void @probe() #0 !dbg !4 !go.funcinfo !0 { ret void }
+  attributes #0 = { "go-leaf"="true" "go-no-split"="true" "go-no-frame-checked"="true" }
+  !go.version = !{!7}
+  !llvm.module.flags = !{!1}
+  !llvm.dbg.cu = !{!2}
+  !0 = !{i32 0, i8 0, i8 0, i32 1}
+  !1 = !{i32 2, !"Debug Info Version", i32 3}
+  !2 = distinct !DICompileUnit(language: DW_LANG_Go, file: !3, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+  !3 = !DIFile(filename: "probe.go", directory: "/")
+  !4 = distinct !DISubprogram(name: "probe", scope: !3, file: !3, line: 1, type: !5, spFlags: DISPFlagDefinition, unit: !2)
+  !5 = !DISubroutineType(types: !6)
+  !6 = !{}
+  !7 = !{!"go1.26.4"}
+...
+---
+name: probe
+tracksRegLiveness: true
+frameInfo:
+  stackSize: 8
+  adjustsStack: true
+  hasCalls: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.5
+    liveins: $rax
+    CMP32mi $rip, 1, $noreg, @runtime.writeBarrier, $noreg, 0, implicit-def $eflags
+    JCC_1 %bb.5, 4, implicit $eflags
+    JMP_1 %bb.1
+  bb.1:
+    successors: %bb.2
+    liveins: $rax
+    NOOP
+    JMP_1 %bb.2
+  bb.2:
+    successors: %bb.3
+    liveins: $rax
+    MOV64mr $rsp, 1, $noreg, 0, $noreg, $rax
+    JMP_1 %bb.3
+  bb.3:
+    successors: %bb.4
+    liveins: $rax
+    NOOP
+    JMP_1 %bb.4
+  bb.4:
+    successors: %bb.5
+    CALL64pcrel32 @runtime.gcWriteBarrier2, csr_64_allregs_nor11_nosse, implicit $rsp, implicit-def $r11
+    JMP_1 %bb.5
+  bb.5:
+    RET 0
+...
