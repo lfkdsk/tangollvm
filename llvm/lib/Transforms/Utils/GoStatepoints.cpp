@@ -38,6 +38,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator_range.h"
@@ -122,10 +123,20 @@ struct GoStatepoints : public PassInfoMixin<GoStatepoints> {
 
 STATISTIC(NumGCToZero, "Number of ToZero objects");
 STATISTIC(NumGCToZeroBytes, "Number of bytes stored by ToZero");
+STATISTIC(NumGCStackObjectsFrontend,
+          "Number of stack objects described by frontend metadata");
+STATISTIC(NumGCStackObjectsEscaping,
+          "Number of LLVM allocas promoted to stack objects");
+STATISTIC(NumGCStackObjectsPrecise,
+          "Number of LLVM allocas described only by precise stack maps");
 
 // Print the ToZero found at the insert location
 static cl::opt<bool> PrintToZero("gogc-print-tozero", cl::Hidden,
                                   cl::init(false));
+
+// Print how pointer-containing allocas are represented to the Go runtime.
+static cl::opt<bool> PrintStackObjects("gogc-print-stackobjects", cl::Hidden,
+                                      cl::init(false));
 
 // Find a better place for inserting zeroing
 static cl::opt<bool> OptToZeroPosition("gogc-optimize-tozero-position", cl::Hidden,
@@ -3464,6 +3475,94 @@ static bool needsRewriteForGo(CallBase *Call) {
   return !isa<GCStatepointInst>(Call) && !callsInlineAsm(Call) && hasStackMap(Call);
 }
 
+enum class StackObjectUse {
+  Precise,
+  PhiOrSelect,
+  Stored,
+  Call,
+  OtherEscape,
+};
+
+static StringRef stackObjectUseName(StackObjectUse Use) {
+  switch (Use) {
+  case StackObjectUse::Precise:
+    return "precise";
+  case StackObjectUse::PhiOrSelect:
+    return "phi-select";
+  case StackObjectUse::Stored:
+    return "stored";
+  case StackObjectUse::Call:
+    return "call";
+  case StackObjectUse::OtherEscape:
+    return "other-escape";
+  }
+  llvm_unreachable("invalid stack object use");
+}
+
+// An alloca whose address is only used to access its own storage is already
+// represented precisely in each statepoint's locals bitmap.  A stack object is
+// additionally required when a pointer to the storage can be observed through
+// a call, memory, or a merged pointer value: the runtime then needs the object
+// record to resolve an interior stack pointer and scan the complete object.
+static StackObjectUse classifyStackObjectUses(Value *V,
+                                               SmallPtrSetImpl<Value *> &Seen) {
+  if (!Seen.insert(V).second)
+    return StackObjectUse::Precise;
+
+  StackObjectUse Result = StackObjectUse::Precise;
+  for (Use &U : V->uses()) {
+    auto *I = dyn_cast<Instruction>(U.getUser());
+    if (!I)
+      return StackObjectUse::OtherEscape;
+
+    if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+        isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I)) {
+      Result = std::max(Result, classifyStackObjectUses(I, Seen));
+      continue;
+    }
+    if (isa<PHINode>(I) || isa<SelectInst>(I)) {
+      Result = std::max(Result, StackObjectUse::PhiOrSelect);
+      continue;
+    }
+    if (isa<StoreInst>(I)) {
+      if (U.getOperandNo() == 0)
+        Result = std::max(Result, StackObjectUse::Stored);
+      continue;
+    }
+    if (isa<AtomicCmpXchgInst>(I) || isa<AtomicRMWInst>(I)) {
+      if (U.getOperandNo() != 0)
+        Result = std::max(Result, StackObjectUse::Stored);
+      continue;
+    }
+    if (isa<LoadInst>(I) || isa<ICmpInst>(I) || isa<DbgInfoIntrinsic>(I))
+      continue;
+    if (auto *CB = dyn_cast<CallBase>(I)) {
+      if (auto *II = dyn_cast<IntrinsicInst>(CB)) {
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::lifetime_start:
+        case Intrinsic::lifetime_end:
+        case Intrinsic::assume:
+        case Intrinsic::go_metadata:
+          continue;
+        default:
+          break;
+        }
+      }
+      Result = std::max(Result, StackObjectUse::Call);
+      continue;
+    }
+    if (isa<ReturnInst>(I) || isa<PtrToIntInst>(I) ||
+        isa<InsertValueInst>(I) || isa<InsertElementInst>(I)) {
+      Result = std::max(Result, StackObjectUse::OtherEscape);
+      continue;
+    }
+
+    // Unknown address uses must remain conservative.
+    Result = std::max(Result, StackObjectUse::OtherEscape);
+  }
+  return Result;
+}
+
 bool GoStatepoints::runOnFunction(Function &F, DominatorTree &DT,
                                   LoopInfo &LI,
                                   TargetTransformInfo &TTI,
@@ -5172,7 +5271,6 @@ static void computeLiveInValues(DominatorTree &DT, LoopInfo &LI, Function &F,
   } // while (!Worklist.empty())
 
   {
-    // TODO: collect all Alloca that has pointers
     LLVMContext& Context = F.getContext();
     Metadata *Zero = ConstantAsMetadata::get(ConstantInt::get(Type::getInt64Ty(Context), 0));
     Metadata *Empty = MDString::get(Context, "go.empty");
@@ -5185,9 +5283,28 @@ static void computeLiveInValues(DominatorTree &DT, LoopInfo &LI, Function &F,
       if (!hasPointerTy(AI->getAllocatedType()))
         continue;
 
-      if (AI->hasMetadata("go.stackobject.gcdata"))
+      if (AI->hasMetadata("go.stackobject.gcdata")) {
+        ++NumGCStackObjectsFrontend;
+        if (PrintStackObjects)
+          dbgs() << "GoStackObject: " << F.getName()
+                 << " frontend " << *AI << "\n";
         continue;
+      }
 
+      SmallPtrSet<Value *, 16> Seen;
+      StackObjectUse Use = classifyStackObjectUses(AI, Seen);
+      if (Use == StackObjectUse::Precise) {
+        ++NumGCStackObjectsPrecise;
+        if (PrintStackObjects)
+          dbgs() << "GoStackObject: " << F.getName()
+                 << " precise " << *AI << "\n";
+        continue;
+      }
+
+      ++NumGCStackObjectsEscaping;
+      if (PrintStackObjects)
+        dbgs() << "GoStackObject: " << F.getName() << " "
+               << stackObjectUseName(Use) << " " << *AI << "\n";
       AI->setMetadata("go.stackobject.gcdata", MD);
     }
   }
