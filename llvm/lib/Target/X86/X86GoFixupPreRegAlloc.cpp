@@ -1089,10 +1089,26 @@ bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
           MI->eraseFromParent();
         }
       }
-      if (MRI->use_empty(Op.Dst))
-        Op.Copy->eraseFromParent();
-      else
-        RetainedCopies.insert(Op.Copy);
+      // Any constrained/tied uses left over still need a virtual input.
+      // Re-read RSP at each use: an entry-time copy could otherwise be spilled
+      // across a statepoint and become stale when Go copies the stack. These
+      // local copies are not candidates for another substitution iteration.
+      SmallVector<MachineInstr *, 8> RemainingUses;
+      for (MachineInstr &Use : MRI->use_instructions(Op.Dst))
+        if (!llvm::is_contained(RemainingUses, &Use))
+          RemainingUses.push_back(&Use);
+      for (MachineInstr *Use : RemainingUses) {
+        Register Local = MRI->createVirtualRegister(MRI->getRegClass(Op.Dst));
+        MachineInstr *Copy = BuildMI(*Use->getParent(), Use->getIterator(),
+                                     Use->getDebugLoc(),
+                                     TII->get(TargetOpcode::COPY), Local)
+                                 .addReg(Op.Src);
+        RetainedCopies.insert(Copy);
+        for (MachineOperand &MO : Use->operands())
+          if (MO.isReg() && MO.getReg() == Op.Dst)
+            MO.setReg(Local);
+      }
+      Op.Copy->eraseFromParent();
     }
 
     Changed = true;
