@@ -42,6 +42,8 @@
 
 using namespace llvm;
 
+static cl::opt<bool> GoGCStats("go-gc-stats", cl::Hidden, cl::init(false));
+
 namespace {
 
 class GoGC : public GCStrategy {
@@ -238,6 +240,9 @@ computeBitVector(const Function * Fn, uint64_t StackSize, bool requireFP,
     }
   }
 
+  if (GoGCStats)
+    dbgs() << "GO-GC-STATS statepoint " << Fn->getName() << " "
+           << ArgsBV.count() + LocalsBV.count() << "\n";
   convertBitVectorToBytesVector(ArgsSize, ArgsBV, ArgsMap);
   convertBitVectorToBytesVector(LocalsSize, LocalsBV, LocalsMap);
 }

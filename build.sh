@@ -25,7 +25,7 @@ cmake -G Ninja \
      "-DCMAKE_INSTALL_PREFIX=${DIR}/llvm-bin-release" \
      ../llvm
 
-cmake --build . -j 24
+cmake --build . -j 20
 
 ninja install
 cp -p "${DIR}/LICENSE.TXT" "${DIR}/llvm-bin-release/LICENSE.TXT"
