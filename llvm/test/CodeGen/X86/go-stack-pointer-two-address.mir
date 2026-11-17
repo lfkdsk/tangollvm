@@ -5,12 +5,14 @@
 # operations without a legal LEA form must retain a virtual stack-pointer copy.
 --- |
   target triple = "x86_64-unknown-linux-goabi"
+  declare void @callee()
   define cc 113 i64 @add_dead_flags() gc "go" { ret i64 0 }
   define cc 113 i64 @add_live_flags() gc "go" { ret i64 0 }
   define cc 113 i64 @sub_register() gc "go" { ret i64 0 }
   define cc 113 i64 @double_sp() gc "go" { ret i64 0 }
   define cc 113 i64 @lea_index() gc "go" { ret i64 0 }
   define cc 113 i64 @short_add() gc "go" { ret i64 0 }
+  define cc 113 i64 @across_call() gc "go" { ret i64 0 }
 ...
 # CHECK-LABEL: name: add_dead_flags
 # CHECK-NOT: COPY $rsp
@@ -29,8 +31,8 @@ body: |
     RET 0, implicit $rax
 ...
 # CHECK-LABEL: name: add_live_flags
-# CHECK: %1:gr64 = COPY $rsp
-# CHECK: ADD64rr %1, %0, implicit-def $eflags
+# CHECK: %[[LIVE_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: ADD64rr %[[LIVE_SP]], %0, implicit-def $eflags
 # CHECK: SETCCr 4, implicit $eflags
 ---
 name: add_live_flags
@@ -47,8 +49,8 @@ body: |
     RET 0, implicit $rax, implicit $cl
 ...
 # CHECK-LABEL: name: sub_register
-# CHECK: %1:gr64 = COPY $rsp
-# CHECK: SUB64rr %1, %0
+# CHECK: %[[SUB_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: SUB64rr %[[SUB_SP]], %0
 ---
 name: sub_register
 tracksRegLiveness: true
@@ -62,8 +64,8 @@ body: |
     RET 0, implicit $rax
 ...
 # CHECK-LABEL: name: double_sp
-# CHECK: %0:gr64 = COPY $rsp
-# CHECK: ADD64rr %0, %0
+# CHECK: %[[DOUBLE_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: ADD64rr %[[DOUBLE_SP]], %[[DOUBLE_SP]]
 ---
 name: double_sp
 tracksRegLiveness: true
@@ -76,8 +78,8 @@ body: |
     RET 0, implicit $rax
 ...
 # CHECK-LABEL: name: lea_index
-# CHECK: %0:gr64_nosp = COPY $rsp
-# CHECK: LEA64r $noreg, 2, %0, 0, $noreg
+# CHECK: %[[INDEX_SP:[0-9]+]]:gr64_nosp = COPY $rsp
+# CHECK: LEA64r $noreg, 2, %[[INDEX_SP]], 0, $noreg
 ---
 name: lea_index
 tracksRegLiveness: true
@@ -90,8 +92,8 @@ body: |
     RET 0, implicit $rax
 ...
 # CHECK-LABEL: name: short_add
-# CHECK: %0:gr64 = COPY $rsp
-# CHECK: ADD64ri8 %0, 8
+# CHECK: %[[SHORT_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: ADD64ri8 %[[SHORT_SP]], 8
 ---
 name: short_add
 tracksRegLiveness: true
@@ -102,4 +104,24 @@ body: |
     %1:gr64 = ADD64ri8 %0, 8, implicit-def dead $eflags
     $rax = COPY %1
     RET 0, implicit $rax
+...
+# CHECK-LABEL: name: across_call
+# CHECK-NOT: COPY $rsp
+# CHECK: CALL64pcrel32 @callee
+# CHECK: %[[CALL_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK-NEXT: %2:gr64 = ADD64rr %[[CALL_SP]], %1, implicit-def $eflags
+---
+name: across_call
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp
+    %0:gr64 = COPY $rsp
+    CALL64pcrel32 @callee, csr_64, implicit $rsp, implicit $ssp, implicit-def $rsp, implicit-def $ssp
+    %1:gr64 = MOV64ri32 8
+    %2:gr64 = ADD64rr %0, %1, implicit-def $eflags
+    %3:gr8 = SETCCr 4, implicit $eflags
+    $rax = COPY %2
+    $cl = COPY %3
+    RET 0, implicit $rax, implicit $cl
 ...
