@@ -838,6 +838,14 @@ bool RemoveRedundantCopy::replace(MachineInstr &MI) {
       if (MO.isDef()) {
         report_fatal_error("cannot define in function body");
       }
+      // In particular, an LEA index cannot be RSP. Keep the virtual copy
+      // for uses whose operand constraints do not admit the physical register.
+      const MachineFunction &MF = *MI.getMF();
+      const auto &ST = MF.getSubtarget<X86Subtarget>();
+      const TargetRegisterClass *RC = ST.getInstrInfo()->getRegClass(
+          MI.getDesc(), MO.getOperandNo(), ST.getRegisterInfo(), MF);
+      if (MO.getSubReg() || (RC && !RC->contains(Src)))
+        continue;
       replaceReg(MO, Src);
       Changed = true;
     }
@@ -1010,12 +1018,13 @@ bool X86GoFixupPreRegAllocPass::markUnsafePoint() {
 bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
   bool Changed = false;
 
+  SmallPtrSet<MachineInstr *, 16> RetainedCopies;
   while (true) {
     std::vector<RemoveRedundantCopy> RemoveOpSP;
 
     for (auto &MBB : *MF) {
       for (auto &MI : MBB) {
-        if (MI.isCopy()) {
+        if (MI.isCopy() && !RetainedCopies.contains(&MI)) {
           const MachineOperand &Dst = MI.getOperand(0);
           const MachineOperand &Src = MI.getOperand(1);
           if (Src.isReg() && Register::isPhysicalRegister(Src.getReg()) && isGoStackPointerRegister(Src.getReg())) {
@@ -1047,31 +1056,21 @@ bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
           Register DstReg;
           if (isTwoAddrUse(MI, Op.Dst, DstReg)) {
             switch (MI.getOpcode()) {
-              case X86::ADD64ri8:
-              case X86::ADD64ri32: {
-                // TODO: duffzero may produce -0x20, rsp
-                // cannot access out-of-bounds value with OpSP
-                // MachineOperand &Imm = MI.getOperand(2);
-                // assert(Imm.isImm() && Imm.getImm() >= 0 && "invariant: must be positive imm");
-                break;
-              }
-              case X86::SUB64ri8:
-              case X86::SUB64ri32: {
-                // MachineOperand &Imm = MI.getOperand(2);
-                // // cannot access out-of-bounds value with OpSP
-                // assert(Imm.isImm() && Imm.getImm() <= 0 && "invariant: must be negative imm");
-                break;
-              }
-              case X86::INC64r:
-                break;
-              case X86::CMOV64rr:
-                break;
-              default:
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-                dbgs() << "cannot handle MI: " << MI << "\n";
-                MF->dump();
-#endif
-                report_fatal_error("TODO: do not know how to handle two address");
+            case X86::ADD64rr:
+              // RSP is legal as an LEA base, but never as its index.
+              if (MI.getOperand(2).getReg() == Op.Dst)
+                continue;
+              break;
+            case X86::ADD64ri32:
+            case X86::SUB64ri32:
+            case X86::INC64r:
+              break;
+            default:
+              // Keep a virtual copy for tied operations without a supported
+              // three-address form. This includes short-immediate opcodes:
+              // convertToThreeAddress only accepts their full-width forms.
+              // Substituting RSP would tie the result to RSP as well.
+              continue;
             }
 
             // we cannot define RSP here so we cannot simply replace rsp
@@ -1082,17 +1081,18 @@ bool X86GoFixupPreRegAllocPass::optimizeOpSP() {
           Op.replace(MI);
         }
         for (MachineInstr *MI : ToBeReplaced) {
-          // TODO: it is very dangerous here because ADD/SUB may redefine eflags
-          // but LEAQ does not. Fortunately, OpSP should only be used compute address.
-          // Nevertheless, we still need add some check here.
+          // The target hook rejects conversions that would lose live EFLAGS.
           MachineInstr *NewMI = TII->convertToThreeAddress(*MI, nullptr, nullptr);
           if (!NewMI)
-            report_fatal_error("cannot convert to three address");
+            continue;
           Op.replace(*NewMI);
           MI->eraseFromParent();
         }
       }
-      Op.Copy->eraseFromParent();
+      if (MRI->use_empty(Op.Dst))
+        Op.Copy->eraseFromParent();
+      else
+        RetainedCopies.insert(Op.Copy);
     }
 
     Changed = true;
