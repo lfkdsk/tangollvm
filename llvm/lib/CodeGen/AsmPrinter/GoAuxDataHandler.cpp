@@ -675,7 +675,6 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
   }
 
   {
-    SmallDenseSet<const MachineBasicBlock*> MarkedCheckBBs;
     SmallDenseSet<const MachineBasicBlock*> MarkedSuccBBs;
     SmallDenseSet<const MachineInstr*> BarrierCmps;
     SmallDenseSet<const MachineInstr*> MatchedBarrierCmps;
@@ -720,46 +719,52 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
         continue;
 
       SmallDenseSet<const MachineBasicBlock*> Candidates;
-      for (auto &Pred : MBB.predecessors()) {
-        if (!MarkedCheckBBs.insert(Pred).second)
+      SmallVector<const MachineBasicBlock *, 8> Pending;
+      llvm::append_range(Pending, MBB.predecessors());
+      SmallDenseSet<const MachineBasicBlock *> Visited;
+      bool SearchFailed = Pending.empty();
+      bool FoundAnyBarrier = false;
+      while (!Pending.empty() && !SearchFailed) {
+        const MachineBasicBlock *CurrMBB = Pending.pop_back_val();
+        if (!Visited.insert(CurrMBB).second)
           continue;
-        auto *CurrMBB = Pred;
-        const MachineInstr *FoundBarrier = nullptr;
-        SmallDenseSet<const MachineBasicBlock *> Visited;
-        do {
-          // Stop cycles without a recognizable enabled-flag check.
-          if (!Visited.insert(CurrMBB).second)
-            break;
-          Candidates.insert(CurrMBB);
-          bool FnUnsafe = false;
-          FoundBarrier =
-              ReverseMarkBarrierInBlock(CurrMBB, UnsafePoints, [&](auto *I) {
-                if (DebugUnsafePoint)
-                  dbgs() << "Func: " << MF->getName()
-                         << ", MI: " << *I
-                         << ", writeBarrier.xx at BB: " << MBB.getName() << "\n";
+        Candidates.insert(CurrMBB);
+        bool FnUnsafe = false;
+        const MachineInstr *FoundBarrier =
+            ReverseMarkBarrierInBlock(CurrMBB, UnsafePoints, [&](auto *I) {
+              if (DebugUnsafePoint)
+                dbgs() << "Func: " << MF->getName()
+                       << ", MI: " << *I
+                       << ", writeBarrier.xx at BB: " << MBB.getName() << "\n";
 
-                if (StrictUnsafePoint)
-                  FnUnsafe = true;
-              });
+              if (StrictUnsafePoint)
+                FnUnsafe = true;
+            });
 
-          if (FnUnsafe) {
-            MarkAllUnsafe();
-            return;
-          }
-
-          if (FoundBarrier)
-            MatchedBarrierCmps.insert(FoundBarrier);
-          CurrMBB = CurrMBB->getSinglePredecessor();
-        } while (!FoundBarrier && CurrMBB);
-
-        if (!FoundBarrier) {
-          ++NumBarrierFallbacks;
-          if (DebugUnsafePoint)
-            dbgs() << "Go unsafe-point barrier fallback: " << MF->getName() << "\n";
+        if (FnUnsafe) {
           MarkAllUnsafe();
           return;
         }
+
+        if (FoundBarrier) {
+          FoundAnyBarrier = true;
+          MatchedBarrierCmps.insert(FoundBarrier);
+          continue;
+        }
+
+        if (CurrMBB->pred_empty()) {
+          SearchFailed = true;
+          break;
+        }
+        llvm::append_range(Pending, CurrMBB->predecessors());
+      }
+
+      if (SearchFailed || !FoundAnyBarrier) {
+        ++NumBarrierFallbacks;
+        if (DebugUnsafePoint)
+          dbgs() << "Go unsafe-point barrier fallback: " << MF->getName() << "\n";
+        MarkAllUnsafe();
+        return;
       }
       if (Candidates.empty())
         continue;

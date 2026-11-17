@@ -1,0 +1,67 @@
+# RUN: llc -start-after=prologepilog -filetype=obj -go-debug-unsafe-point %s -o %t.o 2>&1 | FileCheck %s --check-prefix=FULL
+# RUN: sed 's/@runtime.writeBarrier + 0, /@runtime.writeBarrier + 4, /' %s | llc -x=mir -start-after=prologepilog -filetype=obj -go-debug-unsafe-point -o %t.partial.o 2>&1 | FileCheck %s --check-prefix=PARTIAL
+# RUN: sed -e 's/@runtime.writeBarrier, /@runtime.writeBarrier + 4, /' -e 's/@runtime.writeBarrier + 0, /@runtime.writeBarrier + 4, /' %s | llc -x=mir -start-after=prologepilog -filetype=obj -go-debug-unsafe-point -o %t.none.o 2>&1 | FileCheck %s --check-prefix=NONE
+# REQUIRES: x86-registered-target
+#
+# Two independently checked paths merge immediately before the barrier call.
+# Every incoming path must find a check. If only one or neither path matches,
+# the analysis must conservatively mark the whole function unsafe.
+# FULL-NOT: Go unsafe-point barrier fallback: merge
+# FULL: GO-GC-STATS unsafe-block merge
+# PARTIAL: Go unsafe-point barrier fallback: merge
+# PARTIAL: GO-GC-STATS allunsafe merge
+# NONE: Go unsafe-point barrier fallback: merge
+# NONE: GO-GC-STATS allunsafe merge
+--- |
+  target triple = "x86_64-unknown-linux-goabi"
+  @runtime.writeBarrier = external global i32
+  declare cc 113 ptr @runtime.gcWriteBarrier2()
+  define cc 113 void @merge() #0 !dbg !4 !go.funcinfo !0 { ret void }
+  attributes #0 = { "go-leaf"="true" "go-no-split"="true" "go-no-frame-checked"="true" }
+  !go.version = !{!7}
+  !llvm.module.flags = !{!1}
+  !llvm.dbg.cu = !{!2}
+  !0 = !{i32 0, i8 0, i8 0, i32 1}
+  !1 = !{i32 2, !"Debug Info Version", i32 3}
+  !2 = distinct !DICompileUnit(language: DW_LANG_Go, file: !3, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+  !3 = !DIFile(filename: "merge.go", directory: "/")
+  !4 = distinct !DISubprogram(name: "merge", scope: !3, file: !3, line: 1, type: !5, spFlags: DISPFlagDefinition, unit: !2)
+  !5 = !DISubroutineType(types: !6)
+  !6 = !{}
+  !7 = !{!"go1.26.4"}
+...
+---
+name: merge
+tracksRegLiveness: true
+frameInfo:
+  stackSize: 8
+  adjustsStack: true
+  hasCalls: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $eax, $rax
+    CMP32ri $eax, 0, implicit-def $eflags
+    JCC_1 %bb.2, 4, implicit $eflags
+    JMP_1 %bb.1
+  bb.1:
+    successors: %bb.3, %bb.4
+    liveins: $rax
+    CMP32mi $rip, 1, $noreg, @runtime.writeBarrier, $noreg, 0, implicit-def $eflags
+    JCC_1 %bb.4, 4, implicit $eflags
+    JMP_1 %bb.3
+  bb.2:
+    successors: %bb.3, %bb.4
+    liveins: $rax
+    CMP32mi $rip, 1, $noreg, @runtime.writeBarrier + 0, $noreg, 0, implicit-def $eflags
+    JCC_1 %bb.4, 4, implicit $eflags
+    JMP_1 %bb.3
+  bb.3:
+    successors: %bb.4
+    liveins: $rax
+    MOV64mr $rsp, 1, $noreg, 0, $noreg, $rax
+    CALL64pcrel32 @runtime.gcWriteBarrier2, csr_64_allregs_nor11_nosse, implicit $rsp, implicit-def $r11
+    JMP_1 %bb.4
+  bb.4:
+    RET 0
+...
