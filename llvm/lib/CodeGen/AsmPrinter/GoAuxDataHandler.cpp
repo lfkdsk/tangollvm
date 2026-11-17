@@ -16,6 +16,7 @@
 #include "GoAuxDataHandler.h"
 #include "GoGCProgWriter.h"
 #include "llvm/ADT/BreadthFirstIterator.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -36,6 +37,9 @@
 #include "llvm/Target/TargetLoweringObjectFile.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "go-unsafe-point"
+STATISTIC(NumBarrierFallbacks, "Functions made all-unsafe after barrier search failure");
 
 static cl::opt<bool> TangoLLVMLTO("tangollvm-lto", cl::Hidden, cl::init(false));
 
@@ -538,10 +542,9 @@ static std::pair<bool, bool> IsBarrierCmp(const MachineInstr* MI) {
   return {false, false};
 }
 
-static bool ReverseMarkBarrierInBlock(const MachineBasicBlock* MBB,
+static const MachineInstr *ReverseMarkBarrierInBlock(const MachineBasicBlock* MBB,
                                       DenseSet<const MachineInstr*> &UnsafePoints,
                                       std::function<void(const MachineInstr*)> Fn) {
-  bool FoundBarrier = false;
   for (auto It = MBB->rbegin(), E = MBB->rend(); It != E; It++) {
     if (It->isMetaInstruction())
       continue;
@@ -549,15 +552,18 @@ static bool ReverseMarkBarrierInBlock(const MachineBasicBlock* MBB,
     auto [WB, Enable] = IsBarrierCmp(&*It);
     if (WB) {
       if (Enable) {
-        return true;
+        return &*It;
       }
       Fn(&*It);
     }
   }
-  return false;
+  return nullptr;
 }
 
 void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
+  if (DebugUnsafePoint)
+    dbgs() << "GO-GC-STATS function " << MF->getName() << " "
+           << MF->getFunction().hasFnAttribute("go-no-split") << "\n";
   if (!EnableUnsafePoint)
     return;
 
@@ -565,6 +571,8 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
   auto MarkAllUnsafe = [&]() {
     UnsafePoints.clear();
     AllUnsafe = true;
+    if (DebugUnsafePoint)
+      dbgs() << "GO-GC-STATS allunsafe " << MF->getName() << "\n";
   };
 
   if (MF->getFunction().hasFnAttribute("go.allunsafe") ||
@@ -670,6 +678,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
     SmallDenseSet<const MachineBasicBlock*> MarkedCheckBBs;
     SmallDenseSet<const MachineBasicBlock*> MarkedSuccBBs;
     SmallDenseSet<const MachineInstr*> BarrierCmps;
+    SmallDenseSet<const MachineInstr*> MatchedBarrierCmps;
     for (const auto &MBB : *MF) {
       SmallDenseSet<const MachineInstr*> MIs;
       bool FoundGCWrite = false;
@@ -714,10 +723,16 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       for (auto &Pred : MBB.predecessors()) {
         if (!MarkedCheckBBs.insert(Pred).second)
           continue;
-        auto *CurrMBB = const_cast<MachineBasicBlock*>(Pred);
+        auto *CurrMBB = Pred;
+        const MachineInstr *FoundBarrier = nullptr;
+        SmallDenseSet<const MachineBasicBlock *> Visited;
         do {
+          // Stop cycles without a recognizable enabled-flag check.
+          if (!Visited.insert(CurrMBB).second)
+            break;
+          Candidates.insert(CurrMBB);
           bool FnUnsafe = false;
-          bool FoundBarrier =
+          FoundBarrier =
               ReverseMarkBarrierInBlock(CurrMBB, UnsafePoints, [&](auto *I) {
                 if (DebugUnsafePoint)
                   dbgs() << "Func: " << MF->getName()
@@ -733,14 +748,17 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
             return;
           }
 
-          Candidates.insert(Pred);
+          if (FoundBarrier)
+            MatchedBarrierCmps.insert(FoundBarrier);
           CurrMBB = CurrMBB->getSinglePredecessor();
-        } while (!FoundGCWrite && CurrMBB);
+        } while (!FoundBarrier && CurrMBB);
 
-        if (!FoundGCWrite) {
-          MF->print(dbgs());
-          report_fatal_error("can't find runtime.writeBarrier for MBB: " +
-                             Pred->getName());
+        if (!FoundBarrier) {
+          ++NumBarrierFallbacks;
+          if (DebugUnsafePoint)
+            dbgs() << "Go unsafe-point barrier fallback: " << MF->getName() << "\n";
+          MarkAllUnsafe();
+          return;
         }
       }
       if (Candidates.empty())
@@ -759,7 +777,10 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
     }
 
     for (auto *MI : BarrierCmps)
-      if (!UnsafePoints.contains(MI)) {
+      // Being unsafe for another reason does not prove that this check
+      // has a protected barrier region. Process every unmatched check; using
+      // UnsafePoints here made coverage depend on DenseSet iteration order.
+      if (!MatchedBarrierCmps.contains(MI)) {
         auto *MBB = MI->getParent();
         if (MBB->succ_size() != 2) {
           if (DebugUnsafePoint) {
@@ -841,6 +862,19 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
   }
 
   AllUnsafe = false;
+  if (DebugUnsafePoint) {
+    for (const auto &MBB : *MF) {
+      unsigned Unsafe = 0, Total = 0;
+      for (const auto &MI : MBB) {
+        if (MI.isMetaInstruction())
+          continue;
+        ++Total;
+        Unsafe += UnsafePoints.contains(&MI);
+      }
+      dbgs() << "GO-GC-STATS unsafe-block " << MF->getName() << " "
+             << MBB.getNumber() << " " << Unsafe << " " << Total << "\n";
+    }
+  }
   if (UnsafePoints.empty())
     assert(MF->getFunction().hasFnAttribute("go-leaf"));
 }
