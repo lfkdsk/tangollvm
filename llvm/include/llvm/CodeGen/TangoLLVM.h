@@ -11,6 +11,7 @@
 
 #include <llvm/TangoLLVM/TangoLLVM.h>
 #include <llvm/CodeGen/MachineInstr.h>
+#include <llvm/CodeGen/MachineMemOperand.h>
 
 
 namespace llvm {
@@ -19,6 +20,8 @@ namespace llvm {
 class TangoLLVMCodeGen {
 
 public:
+  // Identifies a store proven to write an incoming argument to its ABI slot.
+  static constexpr auto IncomingArgSpill = MachineMemOperand::MOTargetFlag1;
 
   static bool isMoreStackCall(const MachineInstr &MI) {
     if (!MI.isCall())

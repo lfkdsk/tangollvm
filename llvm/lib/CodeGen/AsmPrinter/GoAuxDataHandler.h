@@ -58,6 +58,11 @@ private:
   std::vector<PCData> PCStackMapIndex;
   std::vector<PCData> PCIndex;
 
+  StringRef ArgInfo;
+  SmallVector<char, 8> ArgLiveInfo;
+  DenseMap<const MachineInstr *, int32_t> ArgLiveAtInstruction;
+  std::vector<PCData> PCArgLive;
+
   std::vector<MCGoFileEntry> FileTable;
   DenseMap<DIFile*, int32_t> FileTableMap;
   std::vector<MCGoDwarfEntry> DwarfTable;
@@ -149,6 +154,10 @@ private:
     PCInline.clear();
     PCStackMapIndex.clear();
     PCIndex.clear();
+    ArgInfo = {};
+    ArgLiveInfo.clear();
+    ArgLiveAtInstruction.clear();
+    PCArgLive.clear();
 
     PCUnsafePoint.clear();
     PCStackMapIndex.clear();
@@ -169,6 +178,7 @@ private:
                                     unsigned PtrSize);
   static void typeSetBits(const DataLayout&,Type*,unsigned,BitVector&);
 
+  void computeArgLive(const MachineFunction *MF);
   void computeFunctionSP(const MachineFunction *MF);
   void computeFuncInfo(const MachineFunction *MF);
   void computeFunctionUnsafePoint(const MachineFunction *MF);

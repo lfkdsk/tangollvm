@@ -20,6 +20,7 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/CodeGen/TangoLLVM.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
@@ -1000,6 +1001,133 @@ void MCGoAuxData::typeSetBits(const DataLayout&DL, Type* T, unsigned Off, BitVec
   }
 }
 
+void MCGoAuxData::computeArgLive(const MachineFunction *MF) {
+  const auto &F = MF->getFunction();
+  const auto *MD = F.getMetadata("go.arginfo");
+  if (!MD)
+    return;
+  ArgInfo = cast<MDString>(MD->getOperand(0))->getString();
+
+  // Stack parameters precede the caller-reserved register spill area.
+  // The caller area metadata includes the return address in its offsets.
+  int64_t StartOffset = 0xf0;
+  if (const auto *Area = F.getMetadata("go.caller.args.area"))
+    for (unsigned I = 2; I + 3 < Area->getNumOperands(); I += 4)
+      StartOffset = std::min(
+          StartOffset, mdconst::extract<ConstantInt>(Area->getOperand(I + 1))
+                               ->getSExtValue() - 8);
+
+  struct Slot {
+    int64_t Offset;
+    int64_t Size;
+  };
+  SmallVector<Slot, 10> Slots;
+  // Mirror the print order in runtime.printArgs, including interleaved
+  // aggregate operators and the omission of the implicit dictionary.
+  for (size_t I = 0; I < ArgInfo.size();) {
+    uint8_t Offset = ArgInfo[I++];
+    if (Offset == 0xff)
+      break;
+    if (Offset >= 0xf0)
+      continue;
+    uint8_t Size = ArgInfo[I++];
+    if (Offset >= StartOffset)
+      Slots.push_back({Offset, Size});
+  }
+  if (Slots.empty())
+    return;
+  assert(Slots.size() <= 10 && StartOffset >= 0);
+
+  const auto &MFI = MF->getFrameInfo();
+  struct Transfer {
+    uint16_t Kill = 0;
+    uint16_t Gen = 0;
+    uint16_t apply(uint16_t Live) const { return (Live & ~Kill) | Gen; }
+  };
+  DenseMap<const MachineInstr *, Transfer> Effects;
+  DenseMap<const MachineBasicBlock *, Transfer> BlockEffects;
+  for (const auto &MBB : *MF) {
+    auto &Block = BlockEffects[&MBB];
+    for (const auto &MI : MBB) {
+      Transfer Effect;
+      for (const auto *MMO : MI.memoperands()) {
+        const auto *PSV =
+            dyn_cast_or_null<FixedStackPseudoSourceValue>(MMO->getPseudoValue());
+        if (!MMO->isStore() || !PSV ||
+            !MFI.isFixedObjectIndex(PSV->getFrameIndex()))
+          continue;
+        int64_t Offset = MFI.getObjectOffset(PSV->getFrameIndex()) +
+                         MMO->getOffset();
+        auto Size = MMO->getSize();
+        for (const auto &[I, Slot] : llvm::enumerate(Slots)) {
+          uint16_t Bit = uint16_t(1) << I;
+          if (Offset < Slot.Offset + Slot.Size &&
+              (!Size.hasValue() ||
+               Slot.Offset < Offset + int64_t(Size.getValue())))
+            Effect.Kill |= Bit;
+          if ((MMO->getFlags() & TangoLLVMCodeGen::IncomingArgSpill) &&
+              Offset == Slot.Offset && Size.hasValue() &&
+              Size.getValue() == uint64_t(Slot.Size))
+            Effect.Gen |= Bit;
+        }
+      }
+      if (Effect.Kill || Effect.Gen) {
+        Effects.try_emplace(&MI, Effect);
+        Block.Kill |= Effect.Kill;
+        Block.Gen = Effect.apply(Block.Gen);
+      }
+    }
+  }
+
+  // Solve a forward must analysis over the final machine CFG. Start reachable
+  // non-entry blocks at top so valid spills survive loop backedges.
+  DenseMap<const MachineBasicBlock *, uint16_t> In, Out;
+  ReversePostOrderTraversal<const MachineFunction *> Order(MF);
+  for (const auto *MBB : Order)
+    Out[MBB] = (1u << Slots.size()) - 1;
+  bool Changed;
+  do {
+    Changed = false;
+    for (const auto *MBB : Order) {
+      uint16_t Live = (1u << Slots.size()) - 1;
+      if (MBB == &MF->front() || MBB->pred_empty())
+        Live = 0;
+      else
+        for (const auto *Pred : MBB->predecessors())
+          Live &= Out.lookup(Pred);
+      In[MBB] = Live;
+      uint16_t Result = BlockEffects.lookup(MBB).apply(Live);
+      Changed |= Result != Out[MBB];
+      Out[MBB] = Result;
+    }
+  } while (Changed);
+
+  // The first byte is the first register slot offset. PCDATA values index
+  // two-byte bitmaps in this FUNCDATA, including the all-dead bitmap.
+  ArgLiveInfo.push_back(char(StartOffset));
+  DenseMap<uint16_t, int32_t> Indices;
+  auto IndexFor = [&](uint16_t Live) {
+    auto [It, Inserted] = Indices.try_emplace(Live, ArgLiveInfo.size());
+    if (Inserted) {
+      ArgLiveInfo.push_back(char(Live));
+      ArgLiveInfo.push_back(char(Live >> 8));
+    }
+    return It->second;
+  };
+  PCArgLive.emplace_back(IndexFor(0), EntryPC);
+  for (const auto &MBB : *MF) {
+    uint16_t Live = In.lookup(&MBB);
+    std::optional<uint16_t> Previous;
+    for (const auto &MI : MBB) {
+      if (!MI.isMetaInstruction() && Previous != Live) {
+        ArgLiveAtInstruction.try_emplace(&MI, IndexFor(Live));
+        Previous = Live;
+      }
+      Live = Effects.lookup(&MI).apply(Live);
+    }
+  }
+}
+
 void MCGoAuxData::beginFunctionImpl(const MachineFunction *MF) {
   // reset for this function
   resetFunction();
@@ -1011,6 +1139,7 @@ void MCGoAuxData::beginFunctionImpl(const MachineFunction *MF) {
   computeFunctionSP(MF);
   computeFuncInfo(MF);
   computeFunctionUnsafePoint(MF);
+  computeArgLive(MF);
 
   {
     // Every Go function has a PC TText
@@ -1288,6 +1417,29 @@ void MCGoAuxData::endFunctionImpl(const MachineFunction *MF) {
     }
   }
 
+  if (!ArgInfo.empty()) {
+    auto EmitLabel = [&](StringRef Suffix) {
+      Asm->OutStreamer->emitLabel(
+          Asm->OutContext.getOrCreateSymbol((MF->getName() + Suffix).str()));
+    };
+    EmitLabel("..arginfo1");
+    Asm->OutStreamer->emitBinaryData(ArgInfo);
+    if (!ArgLiveInfo.empty()) {
+      EmitLabel("..argliveinfo");
+      Asm->OutStreamer->emitBinaryData(StringRef(ArgLiveInfo.data(),
+                                                ArgLiveInfo.size()));
+      EmitLabel("..pcargliveindex");
+      // Use fixed-width pairs in the object so the Go patcher can coalesce
+      // labels at the same PC after assembly and then encode Go PCDATA.
+      PCArgLive.emplace_back(0, EndFunc);
+      for (const auto &Entry : PCArgLive) {
+        Asm->OutStreamer->emitValue(
+            buildSymbolDiff(Asm->OutContext, Entry.PC, EntryPC), 4);
+        Asm->OutStreamer->emitInt32(Entry.Value);
+      }
+    }
+  }
+
   if (LastSPAdjust != -1) {
     appendPCData(PCSP, LastSPAdjust, EndFunc);
 
@@ -1555,6 +1707,10 @@ void MCGoAuxData::beginInstruction(const MachineInstr *MI) {
   if (MI->isMetaInstruction()) {
     return;
   }
+
+  if (const auto It = ArgLiveAtInstruction.find(MI);
+      It != ArgLiveAtInstruction.end() && PCArgLive.back().Value != It->second)
+    PCArgLive.emplace_back(It->second, getOrCreatePrePCSymbol(MI));
 
   {
     // TODO: we simply track DebugLoc for every machine instr;
