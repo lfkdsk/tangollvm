@@ -1236,6 +1236,10 @@ func (v Value) CalledValue() (rv Value) {
 func (v Value) IsTailCall() bool    { return C.TangoLLVMIsTailCall(v.C) != 0 }
 func (v Value) SetTailCall(is bool) { C.TangoLLVMSetTailCall(v.C, boolToLLVMBool(is)) }
 
+func (v Value) SetMustTailCall() {
+	C.TangoLLVMSetTailCallKind(v.C, C.LLVMTailCallKindMustTail)
+}
+
 // Operations on phi nodes
 func (v Value) AddIncoming(vals []Value, blocks []BasicBlock) {
 	ptr, nvals := llvmValueRefs(vals)

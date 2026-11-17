@@ -3447,7 +3447,8 @@ void X86FrameLowering::adjustForSegmentedStacks(
       bool leaf = true;
       for (auto &MBB : MF) {
         for (auto &MI : MBB) {
-          if (!MI.isCall())
+          // A tail jump transfers control after releasing this frame.
+          if (!MI.isCall() || MI.isReturn())
             continue;
 
           // Get callee operand.
