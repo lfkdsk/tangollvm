@@ -899,6 +899,11 @@ GlobalVariable* GORoDataInitializerPass::materializeROInit(GlobalVariable &G, Mo
 
   auto R = data.relocs;
   auto &DL = M.getDataLayout();
+  // Go's symbol data may omit implicit trailing zeros. A shorter
+  // materialized object would make loads from that tail out of bounds.
+  if (Bytes.size() < DL.getTypeAllocSize(G.getValueType()))
+    return nullptr;
+
   if (R.empty() && isa<StructType>(G.getValueType())) {
       LLVMContext &C = M.getContext();
       Type *T = G.getValueType();
