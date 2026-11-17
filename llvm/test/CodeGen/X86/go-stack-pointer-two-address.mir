@@ -1,4 +1,6 @@
 # RUN: llc -run-pass=x86-go-fixup-preregalloc -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -run-pass=x86-go-fixup-preregalloc,twoaddressinstruction -verify-machineinstrs %s -o %t.twoaddr.mir
+# RUN: llc -run-pass=x86-go-fixup-preregalloc,twoaddressinstruction,register-coalescer,greedy,virtregrewriter -verify-machineinstrs %s -o %t.ra.mir
 # REQUIRES: x86-registered-target
 # A stack address may be the tied input to a register-register add after ISel.
 # Convert it to a three-address LEA without ever defining RSP. Live flags and
@@ -14,6 +16,11 @@
   define cc 113 i64 @short_add() gc "go" { ret i64 0 }
   define cc 113 i64 @across_call() gc "go" { ret i64 0 }
   define cc 113 i64 @two_sp_copies() gc "go" { ret i64 0 }
+  define cc 113 i64 @short_sub() gc "go" { ret i64 0 }
+  define cc 113 i64 @min_sub() gc "go" { ret i64 0 }
+  define cc 113 i64 @short_live_flags() gc "go" { ret i64 0 }
+  define cc 113 i64 @cmov_sp() gc "go" { ret i64 0 }
+  define cc 113 i64 @untied_sp() gc "go" { ret i64 0 }
 ...
 # CHECK-LABEL: name: add_dead_flags
 # CHECK-NOT: COPY $rsp
@@ -93,8 +100,8 @@ body: |
     RET 0, implicit $rax
 ...
 # CHECK-LABEL: name: short_add
-# CHECK: %[[SHORT_SP:[0-9]+]]:gr64 = COPY $rsp
-# CHECK: ADD64ri8 %[[SHORT_SP]], 8
+# CHECK-NOT: COPY $rsp
+# CHECK: LEA64r $rsp, 1, $noreg, 8, $noreg
 ---
 name: short_add
 tracksRegLiveness: true
@@ -127,9 +134,8 @@ body: |
     RET 0, implicit $rax, implicit $cl
 ...
 # CHECK-LABEL: name: two_sp_copies
-# CHECK-NOT: LEA64r
-# CHECK: %[[TWO_SP:[0-9]+]]:gr64 = COPY $rsp
-# CHECK-NEXT: %2:gr64 = ADD64rr %[[TWO_SP]], $rsp, implicit-def dead $eflags
+# CHECK: %[[TWO_SP:[0-9]+]]:gr64_nosp = COPY $rsp
+# CHECK-NEXT: %2:gr64 = LEA64r $rsp, 1, %[[TWO_SP]], 0, $noreg
 ---
 name: two_sp_copies
 tracksRegLiveness: true
@@ -139,6 +145,81 @@ body: |
     %0:gr64 = COPY $rsp
     %1:gr64 = COPY $rsp
     %2:gr64 = ADD64rr %1, %0, implicit-def dead $eflags
+    $rax = COPY %2
+    RET 0, implicit $rax
+...
+# CHECK-LABEL: name: short_sub
+# CHECK-NOT: COPY $rsp
+# CHECK: LEA64r $rsp, 1, $noreg, -8, $noreg
+---
+name: short_sub
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp
+    %0:gr64 = COPY $rsp
+    %1:gr64 = SUB64ri8 %0, 8, implicit-def dead $eflags
+    $rax = COPY %1
+    RET 0, implicit $rax
+...
+# CHECK-LABEL: name: min_sub
+# CHECK: %[[MIN_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: SUB64ri32 %[[MIN_SP]], -2147483648
+---
+name: min_sub
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp
+    %0:gr64 = COPY $rsp
+    %1:gr64 = SUB64ri32 %0, -2147483648, implicit-def dead $eflags
+    $rax = COPY %1
+    RET 0, implicit $rax
+...
+# CHECK-LABEL: name: short_live_flags
+# CHECK: %[[SL_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK: ADD64ri8 %[[SL_SP]], 8, implicit-def $eflags
+---
+name: short_live_flags
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp
+    %0:gr64 = COPY $rsp
+    %1:gr64 = ADD64ri8 %0, 8, implicit-def $eflags
+    %2:gr8 = SETCCr 4, implicit $eflags
+    $rax = COPY %1
+    $cl = COPY %2
+    RET 0, implicit $rax, implicit $cl
+...
+# CHECK-LABEL: name: cmov_sp
+# CHECK: %[[CMOV_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK-NEXT: %2:gr64 = CMOV64rr %[[CMOV_SP]], %0, 4, implicit $eflags
+---
+name: cmov_sp
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp, $rax
+    %0:gr64 = COPY $rax
+    %1:gr64 = COPY $rsp
+    CMP64rr %0, %0, implicit-def $eflags
+    %2:gr64 = CMOV64rr %1, %0, 4, implicit $eflags
+    $rax = COPY %2
+    RET 0, implicit $rax
+...
+# CHECK-LABEL: name: untied_sp
+# CHECK: %[[UNTIED_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK-NEXT: %2:gr64 = ADD64rr %0, %[[UNTIED_SP]], implicit-def dead $eflags
+---
+name: untied_sp
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp, $rax
+    %0:gr64 = COPY $rax
+    %1:gr64 = COPY $rsp
+    %2:gr64 = ADD64rr %0, %1, implicit-def dead $eflags
     $rax = COPY %2
     RET 0, implicit $rax
 ...

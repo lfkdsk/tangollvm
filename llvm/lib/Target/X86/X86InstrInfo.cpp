@@ -1300,6 +1300,11 @@ bool X86InstrInfo::classifyLEAReg(MachineInstr &MI, const MachineOperand &Src,
     NewSrc = SrcReg;
     assert(!Src.isUndef() && "Undef op doesn't need optimization");
 
+    // Physical registers cannot be constrained by MRI. Check them explicitly,
+    // in particular when RSP would become an unencodable LEA index.
+    if (NewSrc.isPhysical() && !RC->contains(NewSrc))
+      return false;
+
     if (NewSrc.isVirtual() && !MF.getRegInfo().constrainRegClass(NewSrc, RC))
       return false;
 
@@ -1314,6 +1319,8 @@ bool X86InstrInfo::classifyLEAReg(MachineInstr &MI, const MachineOperand &Src,
 
     NewSrc = getX86SubSuperRegister(SrcReg, 64);
     assert(NewSrc.isValid() && "Invalid Operand");
+    if (!RC->contains(NewSrc))
+      return false;
     assert(!Src.isUndef() && "Undef op doesn't need optimization");
   } else {
     // Virtual register of the wrong class, we have to create a temporary 64-bit
@@ -1735,6 +1742,7 @@ MachineInstr *X86InstrInfo::convertToThreeAddress(MachineInstr &MI,
   case X86::ADD16rr:
   case X86::ADD16rr_DB:
     return convertToThreeAddressWithLEA(MIOpc, MI, LV, LIS, Is8BitOp);
+  case X86::ADD64ri8:
   case X86::ADD64ri32:
   case X86::ADD64ri32_DB:
     assert(MI.getNumOperands() >= 3 && "Unknown add instruction!");
@@ -1807,10 +1815,14 @@ MachineInstr *X86InstrInfo::convertToThreeAddress(MachineInstr &MI,
     break;
   }
 
+  case X86::SUB64ri8:
   case X86::SUB64ri32: {
     if (!MI.getOperand(2).isImm())
       return nullptr;
     int64_t Imm = MI.getOperand(2).getImm();
+    // A negated INT32_MIN is not representable as a signed LEA displacement.
+    if (!isInt<32>(-Imm))
+      return nullptr;
     if (!isInt<32>(-Imm))
       return nullptr;
 
