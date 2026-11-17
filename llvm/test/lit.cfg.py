@@ -203,6 +203,7 @@ tools.extend(
         "llvm-link",
         "llvm-lto",
         "llvm-lto2",
+        "tango-thinlto-plan",
         "llvm-mc",
         "llvm-mca",
         "llvm-modextract",
