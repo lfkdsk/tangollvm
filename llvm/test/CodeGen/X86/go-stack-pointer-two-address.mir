@@ -13,6 +13,7 @@
   define cc 113 i64 @lea_index() gc "go" { ret i64 0 }
   define cc 113 i64 @short_add() gc "go" { ret i64 0 }
   define cc 113 i64 @across_call() gc "go" { ret i64 0 }
+  define cc 113 i64 @two_sp_copies() gc "go" { ret i64 0 }
 ...
 # CHECK-LABEL: name: add_dead_flags
 # CHECK-NOT: COPY $rsp
@@ -124,4 +125,20 @@ body: |
     $rax = COPY %2
     $cl = COPY %3
     RET 0, implicit $rax, implicit $cl
+...
+# CHECK-LABEL: name: two_sp_copies
+# CHECK-NOT: LEA64r
+# CHECK: %[[TWO_SP:[0-9]+]]:gr64 = COPY $rsp
+# CHECK-NEXT: %2:gr64 = ADD64rr %[[TWO_SP]], $rsp, implicit-def dead $eflags
+---
+name: two_sp_copies
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rsp
+    %0:gr64 = COPY $rsp
+    %1:gr64 = COPY $rsp
+    %2:gr64 = ADD64rr %1, %0, implicit-def dead $eflags
+    $rax = COPY %2
+    RET 0, implicit $rax
 ...
