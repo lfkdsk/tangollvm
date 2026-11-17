@@ -3481,7 +3481,10 @@ static bool moveITPToDefAndPTIToUse(Function &F) {
 }
 
 static bool needsRewriteForGo(CallBase *Call) {
-  return !isa<GCStatepointInst>(Call) && !callsInlineAsm(Call) && hasStackMap(Call);
+  // A musttail jump tears down this frame. There is no return PC in this
+  // function to describe, and the callee owns the stack map after the jump.
+  return !Call->isMustTailCall() && !isa<GCStatepointInst>(Call) &&
+         !callsInlineAsm(Call) && hasStackMap(Call);
 }
 
 enum class StackObjectUse {
