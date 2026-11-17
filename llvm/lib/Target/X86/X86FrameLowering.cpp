@@ -3532,7 +3532,8 @@ leafSearchDone:
     MF.push_back(allocMBB);
 
     TlsReg = X86::R14; // not tls but loaded g
-    TlsOffset = 16; // G.stackguard0
+    // C functions run on the system stack and check g.stackguard1.
+    TlsOffset = MF.getFunction().hasFnAttribute("go-cfunc") ? 24 : 16;
 
     auto InsertCheck = [&](MachineBasicBlock *CheckMBB, MachineBasicBlock *AllocMBB) {
       MachineBasicBlock * CheckMBB2 = nullptr;
