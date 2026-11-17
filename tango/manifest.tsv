@@ -17,3 +17,4 @@ overlay	src/cmd/internal/llvm/tangollvm.h	-
 overlay	src/cmd/internal/llvm/target.go	-
 overlay	src/cmd/internal/llvm/tools.go	-
 overlay	src/cmd/internal/llvm/tools_test.go	-
+overlay	src/cmd/internal/llvm/thin.go	-
