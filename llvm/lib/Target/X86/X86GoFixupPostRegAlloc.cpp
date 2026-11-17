@@ -41,7 +41,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <iterator>
+#include <set>
 
 #define DEBUG_TYPE "x86-go-fixup-postregalloc"
 
@@ -287,6 +289,42 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
       LiveIn |= TRI->regsOverlap(LI.PhysReg, Reg);
     if (!LiveIn)
       continue;
+    // Prove that Tracked at End still contains this incoming argument.  Walk
+    // backwards through full-register copies and require the proof on every
+    // predecessor of a join.  Cycles are rejected conservatively: accepting
+    // them would require a separate fixed-point proof of the loop backedge.
+    std::set<std::pair<const MachineBasicBlock *, unsigned>> Active;
+    std::function<bool(const MachineBasicBlock *,
+                       MachineBasicBlock::const_instr_iterator, Register)>
+        IsIncoming = [&](const MachineBasicBlock *Block,
+                         MachineBasicBlock::const_instr_iterator End,
+                         Register Tracked) {
+          for (auto It = End; It != Block->instr_begin();) {
+            --It;
+            if (!It->modifiesRegister(Tracked, TRI))
+              continue;
+            auto Copy = TII->isCopyInstr(*It);
+            if (!Copy || !Copy->Destination->isReg() ||
+                !Copy->Source->isReg() ||
+                Copy->Destination->getSubReg() || Copy->Source->getSubReg() ||
+                Copy->Destination->getReg() != Tracked ||
+                !Copy->Source->getReg().isPhysical())
+              return false;
+            Tracked = Copy->Source->getReg();
+          }
+          if (Block == &MF->front())
+            return Tracked == Reg;
+          auto Key = std::make_pair(Block, Tracked.id());
+          if (!Active.insert(Key).second || Block->pred_empty())
+            return false;
+          for (const MachineBasicBlock *Pred : Block->predecessors())
+            if (!IsIncoming(Pred, Pred->instr_end(), Tracked)) {
+              Active.erase(Key);
+              return false;
+            }
+          Active.erase(Key);
+          return true;
+        };
     MachineInstr *Spill = nullptr;
     int FI = 0;
     unsigned SpillBytes = 0;
@@ -298,35 +336,12 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
         int Slot;
         unsigned Bytes = 0;
         Register Src = TII->isStoreToStackSlot(MI, Slot, Bytes);
-        if (!Src || !TRI->regsOverlap(Src, Reg))
+        if (!Src || !IsIncoming(&MBB, MI.getIterator(), Src))
           continue;
-        bool Original = true;
-        SmallPtrSet<const MachineBasicBlock *, 8> Seen;
-        const MachineBasicBlock *Block = &MBB;
-        MachineBasicBlock::const_instr_iterator End = MI.getIterator();
-        while (true) {
-          if (!Seen.insert(Block).second) {
-            Original = false;
-            break;
-          }
-          for (auto It = Block->instr_begin(); It != End; ++It)
-            if (It->modifiesRegister(Reg, TRI))
-              Original = false;
-          if (!Original || Block == &MF->front())
-            break;
-          if (Block->pred_size() != 1) {
-            Original = false;
-            break;
-          }
-          Block = *Block->pred_begin();
-          End = Block->instr_end();
-        }
-        if (Original) {
-          Spill = &MI;
-          FI = Slot;
-          SpillBytes = Bytes;
-          break;
-        }
+        Spill = &MI;
+        FI = Slot;
+        SpillBytes = Bytes;
+        break;
       }
       if (Spill)
         break;
@@ -362,8 +377,14 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
           if (auto *PSV = dyn_cast_or_null<FixedStackPseudoSourceValue>(
                   MMO->getPseudoValue()))
             Ref |= PSV->getFrameIndex() == FI;
-        if (!Ref || &MI == Spill || MI.isDebugInstr() ||
+        if (!Ref || MI.isDebugInstr() ||
             MI.getOpcode() == TargetOpcode::STATEPOINT)
+          continue;
+        int StoreFI;
+        unsigned StoreBytes = 0;
+        Register StoreSrc = TII->isStoreToStackSlot(MI, StoreFI, StoreBytes);
+        if (StoreSrc && StoreFI == FI && StoreBytes == MFI.getObjectSize(FI) &&
+            IsIncoming(&MBB, MI.getIterator(), StoreSrc))
           continue;
         int LoadFI;
         if (MI.mayStore() || !TII->isLoadFromStackSlot(MI, LoadFI) ||
