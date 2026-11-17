@@ -1,0 +1,35 @@
+# RUN: llc -run-pass=x86-fixup-LEAs -mattr=+lea-uses-ag -verify-machineinstrs %s -o - | FileCheck %s
+# REQUIRES: x86-registered-target
+# Physical registers must obey the same LEA index constraints as virtual
+# registers, including after widening a 32-bit input for LEA64_32r.
+--- |
+  target triple = "x86_64-unknown-linux-gnu"
+  define i32 @physical_index64() { ret i32 0 }
+  define i32 @physical_index32() { ret i32 0 }
+...
+# CHECK-LABEL: name: physical_index64
+# CHECK: $rax = ADD64rr $rax, $rsp
+# CHECK-NOT: LEA64r
+---
+name: physical_index64
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rax, $rsp
+    $rax = ADD64rr $rax, $rsp, implicit-def dead $eflags
+    $eax = MOV32rm $rax, 1, $noreg, 0, $noreg :: (load (s32))
+    RET64 implicit $eax
+...
+# CHECK-LABEL: name: physical_index32
+# CHECK: $eax = ADD32rr $eax, $esp
+# CHECK-NOT: LEA64_32r
+---
+name: physical_index32
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $eax, $rsp
+    $eax = ADD32rr $eax, $esp, implicit-def dead $eflags, implicit-def $rax
+    $eax = MOV32rm $rax, 1, $noreg, 0, $noreg :: (load (s32))
+    RET64 implicit $eax
+...
