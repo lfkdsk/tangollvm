@@ -33,6 +33,7 @@
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/CodeGen/TangoLLVM.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/IR/Function.h"
@@ -368,6 +369,7 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
     // Accept only plain full-slot accesses. In particular, reject address-taking
     // and every other store, including slots merged by stack-slot coloring.
     bool Legal = true;
+    SmallPtrSet<const MachineInstr *, 4> IncomingStores;
     for (auto &MBB : *MF) {
       for (auto &MI : MBB) {
         bool Ref = false;
@@ -384,8 +386,10 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
         unsigned StoreBytes = 0;
         Register StoreSrc = TII->isStoreToStackSlot(MI, StoreFI, StoreBytes);
         if (StoreSrc && StoreFI == FI && StoreBytes == MFI.getObjectSize(FI) &&
-            IsIncoming(&MBB, MI.getIterator(), StoreSrc))
+            IsIncoming(&MBB, MI.getIterator(), StoreSrc)) {
+          IncomingStores.insert(&MI);
           continue;
+        }
         int LoadFI;
         if (MI.mayStore() || !TII->isLoadFromStackSlot(MI, LoadFI) ||
             LoadFI != FI)
@@ -404,11 +408,24 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
         for (auto &MO : MI.operands())
           if (MO.isFI() && MO.getIndex() == FI)
             MO.setIndex(NewFI);
-        for (auto *MMO : MI.memoperands())
+        SmallVector<MachineMemOperand *, 2> MemRefs;
+        bool TagSpill = SpillBytes == Size && F.getMetadata("go.arginfo") &&
+                        IncomingStores.contains(&MI);
+        for (auto *MMO : MI.memoperands()) {
           if (auto *PSV = dyn_cast_or_null<FixedStackPseudoSourceValue>(
-                  MMO->getPseudoValue()))
-            if (PSV->getFrameIndex() == FI)
+                  MMO->getPseudoValue())) {
+            if (PSV->getFrameIndex() == FI) {
               MMO->setValue(NewPSV);
+              if (TagSpill && MMO->isStore())
+                MMO = MF->getMachineMemOperand(
+                    MMO, MMO->getFlags() | TangoLLVMCodeGen::IncomingArgSpill);
+            }
+          }
+          if (TagSpill)
+            MemRefs.push_back(MMO);
+        }
+        if (TagSpill)
+          MI.setMemRefs(*MF, MemRefs);
       }
     MFI.RemoveStackObject(FI);
     Changed = true;

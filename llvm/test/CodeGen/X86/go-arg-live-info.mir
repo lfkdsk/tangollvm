@@ -1,0 +1,60 @@
+# RUN: llc -start-before=x86-go-fixup-postregalloc -filetype=obj %s -o %t.o
+# RUN: llvm-objdump -d %t.o | FileCheck %s --check-prefix=CODE
+# RUN: llvm-objdump -s -j .goaux %t.o | FileCheck %s
+# REQUIRES: x86-registered-target
+
+# A spill on one path becomes live at the reload, and is dead at the merge.
+# ArgInfo describes the single slot at offset 0, followed by ArgLiveInfo
+# (start offset, dead bitmap, live bitmap). The PC pairs follow the bitmaps.
+# CODE:      5: {{.*}} movq %rax, 0x8(%rsp)
+# CODE-NEXT: a: {{.*}} movq 0x8(%rsp), %rax
+# CODE:     12: {{.*}} retq
+# CHECK:      0010 {{[0-9a-f ]+}}0008ff00 00000100
+# CHECK-NEXT: 0020 00000000 01000000 0a000000 03000000
+# CHECK-NEXT: 0030 12000000 01000000 13000000 00000000
+
+--- |
+  target triple = "x86_64-unknown-linux-goabi"
+  define cc 113 i64 @trace(i64 %arg) #0 gc "go" !dbg !4 !go.funcinfo !0 !go.caller.args.area !8 !go.arginfo !9 {
+    ret i64 %arg
+  }
+  attributes #0 = { "go-leaf"="true" "go-no-split"="true" }
+  !go.version = !{!7}
+  !llvm.module.flags = !{!1}
+  !llvm.dbg.cu = !{!2}
+  !0 = !{i32 0, i8 0, i8 0, i32 1}
+  !1 = !{i32 2, !"Debug Info Version", i32 3}
+  !2 = distinct !DICompileUnit(language: DW_LANG_Go, file: !3, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+  !3 = !DIFile(filename: "trace.go", directory: "/")
+  !4 = distinct !DISubprogram(name: "trace", scope: !3, file: !3, line: 1, type: !5, spFlags: DISPFlagDefinition, unit: !2)
+  !5 = !DISubroutineType(types: !6)
+  !6 = !{}
+  !7 = !{!"go1.22.12"}
+  !8 = !{i64 8, i64 8, i64 1, i64 8, i64 8, i64 0}
+  !9 = !{!"\00\08\FF"}
+...
+---
+name: trace
+tracksRegLiveness: true
+liveins:
+  - { reg: '$rax' }
+stack:
+  - { id: 0, type: spill-slot, size: 8, alignment: 8 }
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $rax
+    TEST64rr $rax, $rax, implicit-def $eflags
+    JCC_1 %bb.2, 4, implicit $eflags
+    JMP_1 %bb.1
+  bb.1:
+    successors: %bb.2
+    liveins: $rax
+    MOV64mr %stack.0, 1, $noreg, 0, $noreg, $rax :: (store (s64) into %stack.0)
+    $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
+    $rax = INC64r $rax, implicit-def $eflags
+    JMP_1 %bb.2
+  bb.2:
+    liveins: $rax
+    RET 0, $rax
+...
