@@ -11,7 +11,7 @@ or tools.
 
 This repository owns the LLVM backend, bindings, generated C bridge and their
 licenses. The copy manifest lists the bindings, their notices and license, and a binding test:
-15 files in total. The translator, its test, and runtime Duff assembly are
+16 files in total. The translator, its test, and runtime Duff assembly are
 copied from Tango, never overlaid.
 
 ## Build
