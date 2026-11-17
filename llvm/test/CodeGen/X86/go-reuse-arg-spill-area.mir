@@ -6,6 +6,7 @@
   declare void @callee()
   !9 = !{i64 0, i64 8, i64 -1, i64 16, i64 8, i64 0}
   define cc 113 void @reuse() gc "go" !go.caller.args.area !8 { ret void }
+  define cc 113 void @copy_chain() gc "go" !go.caller.args.area !8 { ret void }
   define cc 113 void @redefined() gc "go" !go.caller.args.area !8 { ret void }
   define cc 113 void @two_stores() gc "go" !go.caller.args.area !8 { ret void }
   define cc 113 void @too_wide() gc "go" !go.caller.args.area !4 { ret void }
@@ -44,6 +45,23 @@ body: |
     $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
     RET 0
 ...
+# CHECK-LABEL: name: copy_chain
+# CHECK: MOV64mr %fixed-stack.0{{.*}}$r10
+---
+name: copy_chain
+tracksRegLiveness: true
+liveins:
+  - { reg: '$rbx' }
+stack:
+  - { id: 0, type: spill-slot, size: 8, alignment: 8 }
+body: |
+  bb.0:
+    liveins: $rbx
+    $r10 = MOV64rr $rbx
+    MOV64mr %stack.0, 1, $noreg, 0, $noreg, $r10 :: (store (s64) into %stack.0)
+    $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
+    RET 0
+...
 # CHECK-LABEL: name: redefined
 # CHECK: MOV64mr %stack.0
 ---
@@ -62,7 +80,8 @@ body: |
     RET 0
 ...
 # CHECK-LABEL: name: two_stores
-# CHECK: MOV64mr %stack.0
+# CHECK: MOV64mr %fixed-stack.0
+# CHECK: MOV64mr %fixed-stack.0
 ---
 name: two_stores
 tracksRegLiveness: true
@@ -204,7 +223,7 @@ body: |
     RET 0
 ...
 # CHECK-LABEL: name: join_spill
-# CHECK: MOV64mr %stack.0
+# CHECK: MOV64mr %fixed-stack.0
 ---
 name: join_spill
 tracksRegLiveness: true
