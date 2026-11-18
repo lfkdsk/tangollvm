@@ -168,6 +168,10 @@ void ProfileGeneratorBase::write(std::unique_ptr<SampleProfileWriter> Writer,
 }
 
 void ProfileGeneratorBase::write() {
+  if (ProfileMap.empty())
+    exitWithError("Generated an empty profile; check the input samples, binary, "
+                  "and profile filters.");
+
   auto WriterOrErr = SampleProfileWriter::create(OutputFilename, OutputFormat);
   if (std::error_code EC = WriterOrErr.getError())
     exitWithError(EC, OutputFilename);

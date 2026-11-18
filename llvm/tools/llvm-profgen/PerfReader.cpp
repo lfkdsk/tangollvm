@@ -1216,10 +1216,15 @@ PerfContent PerfScriptReader::checkPerfScriptType(StringRef FileName) {
     }
     if (!TraceIt.isAtEoF()) {
       if (isLBRSample(TraceIt.getCurrentLine())) {
-        if (Count > 0)
+        auto [First, Rest] = TraceIt.getCurrentLine().ltrim().split(' ');
+        if (First.ends_with(":"))
+          First = Rest.ltrim().split(' ').first;
+
+        // An IP on the LBR line identifies a standalone sample. Earlier
+        // IP-only records may have no branch stack (e.g. at startup).
+        if (Count > 0 && First.starts_with("0x") && First.contains('/'))
           return PerfContent::LBRStack;
-        else
-          return PerfContent::LBR;
+        return PerfContent::LBR;
       }
       TraceIt.advance();
     }

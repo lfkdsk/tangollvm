@@ -1,0 +1,12 @@
+; An IP-only record before an IP + LBR record must not start a call stack.
+; RUN: llvm-profgen --format=text --perfscript=%S/Inputs/inline-noprobe.perfscript --binary=%S/Inputs/inline-noprobe.perfbin --output=%t.expected
+; RUN: printf '     4005dc\n' > %t.script
+; RUN: cat %S/Inputs/inline-noprobe.perfscript >> %t.script
+; RUN: llvm-profgen --format=text --perfscript=%t.script --binary=%S/Inputs/inline-noprobe.perfbin --output=%t.actual
+; RUN: diff %t.expected %t.actual
+;
+; Filtering out all samples must fail before creating a profile.
+; RUN: rm -f %t.empty
+; RUN: not llvm-profgen --perf-event=instructions --perfscript=%S/Inputs/cmov_3.perfscript --binary=%S/Inputs/cmov_3.perfbin --output=%t.empty 2>&1 | FileCheck %s
+; RUN: test ! -e %t.empty
+; CHECK: error: Generated an empty profile
