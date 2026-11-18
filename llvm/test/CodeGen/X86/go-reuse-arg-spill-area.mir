@@ -18,6 +18,9 @@
   define cc 113 void @clobbered_path() gc "go" !go.caller.args.area !8 { ret void }
   define cc 113 void @join_spill() gc "go" !go.caller.args.area !8 { ret void }
   define cc 113 void @overlapping_fixed() gc "go" !go.caller.args.area !8 { ret void }
+  define cc 113 void @loop_backedge() gc "go" !go.caller.args.area !8 { ret void }
+  define cc 113 void @join_copy_both() gc "go" !go.caller.args.area !8 { ret void }
+  define cc 113 void @deep_diamond() gc "go" !go.caller.args.area !8 { ret void }
   !8 = !{i64 0, i64 8, i64 2, i64 16, i64 8, i64 1}
   !4 = !{i64 0, i64 8, i64 2, i64 16, i64 4, i64 0}
 ...
@@ -261,6 +264,191 @@ stack:
   - { id: 0, type: spill-slot, size: 8, alignment: 8 }
 body: |
   bb.0:
+    liveins: $rbx
+    MOV64mr %stack.0, 1, $noreg, 0, $noreg, $rbx :: (store (s64) into %stack.0)
+    $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
+    RET 0
+...
+# CHECK-LABEL: name: loop_backedge
+# CHECK: MOV64mr %stack.0
+---
+name: loop_backedge
+tracksRegLiveness: true
+liveins:
+  - { reg: '$rbx' }
+stack:
+  - { id: 0, type: spill-slot, size: 8, alignment: 8 }
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $rbx
+    JMP_1 %bb.1
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    JCC_1 %bb.3, 4, implicit undef $eflags
+    JMP_1 %bb.2
+
+  bb.2:
+    successors: %bb.1
+    JMP_1 %bb.1
+
+  bb.3:
+    liveins: $rbx
+    MOV64mr %stack.0, 1, $noreg, 0, $noreg, $rbx :: (store (s64) into %stack.0)
+    $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
+    RET 0
+...
+# CHECK-LABEL: name: join_copy_both
+# CHECK: MOV64mr %fixed-stack.0{{.*}}$r10
+---
+name: join_copy_both
+tracksRegLiveness: true
+liveins:
+  - { reg: '$rbx' }
+stack:
+  - { id: 0, type: spill-slot, size: 8, alignment: 8 }
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $rbx
+    JCC_1 %bb.2, 4, implicit undef $eflags
+    JMP_1 %bb.1
+
+  bb.1:
+    successors: %bb.3
+    liveins: $rbx
+    $r10 = MOV64rr $rbx
+    JMP_1 %bb.3
+
+  bb.2:
+    successors: %bb.3
+    liveins: $rbx
+    $r10 = MOV64rr $rbx
+    JMP_1 %bb.3
+
+  bb.3:
+    liveins: $r10
+    MOV64mr %stack.0, 1, $noreg, 0, $noreg, $r10 :: (store (s64) into %stack.0)
+    $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
+    RET 0
+...
+# CHECK-LABEL: name: deep_diamond
+# CHECK: MOV64mr %fixed-stack.0
+---
+name: deep_diamond
+tracksRegLiveness: true
+liveins:
+  - { reg: '$rbx' }
+stack:
+  - { id: 0, type: spill-slot, size: 8, alignment: 8 }
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $rbx
+    JCC_1 %bb.2, 4, implicit undef $eflags
+    JMP_1 %bb.1
+
+  bb.1:
+    successors: %bb.3
+    JMP_1 %bb.3
+
+  bb.2:
+    successors: %bb.3
+    JMP_1 %bb.3
+
+  bb.3:
+    successors: %bb.4, %bb.5
+    JCC_1 %bb.5, 4, implicit undef $eflags
+    JMP_1 %bb.4
+
+  bb.4:
+    successors: %bb.6
+    JMP_1 %bb.6
+
+  bb.5:
+    successors: %bb.6
+    JMP_1 %bb.6
+
+  bb.6:
+    successors: %bb.7, %bb.8
+    JCC_1 %bb.8, 4, implicit undef $eflags
+    JMP_1 %bb.7
+
+  bb.7:
+    successors: %bb.9
+    JMP_1 %bb.9
+
+  bb.8:
+    successors: %bb.9
+    JMP_1 %bb.9
+
+  bb.9:
+    successors: %bb.10, %bb.11
+    JCC_1 %bb.11, 4, implicit undef $eflags
+    JMP_1 %bb.10
+
+  bb.10:
+    successors: %bb.12
+    JMP_1 %bb.12
+
+  bb.11:
+    successors: %bb.12
+    JMP_1 %bb.12
+
+  bb.12:
+    successors: %bb.13, %bb.14
+    JCC_1 %bb.14, 4, implicit undef $eflags
+    JMP_1 %bb.13
+
+  bb.13:
+    successors: %bb.15
+    JMP_1 %bb.15
+
+  bb.14:
+    successors: %bb.15
+    JMP_1 %bb.15
+
+  bb.15:
+    successors: %bb.16, %bb.17
+    JCC_1 %bb.17, 4, implicit undef $eflags
+    JMP_1 %bb.16
+
+  bb.16:
+    successors: %bb.18
+    JMP_1 %bb.18
+
+  bb.17:
+    successors: %bb.18
+    JMP_1 %bb.18
+
+  bb.18:
+    successors: %bb.19, %bb.20
+    JCC_1 %bb.20, 4, implicit undef $eflags
+    JMP_1 %bb.19
+
+  bb.19:
+    successors: %bb.21
+    JMP_1 %bb.21
+
+  bb.20:
+    successors: %bb.21
+    JMP_1 %bb.21
+
+  bb.21:
+    successors: %bb.22, %bb.23
+    JCC_1 %bb.23, 4, implicit undef $eflags
+    JMP_1 %bb.22
+
+  bb.22:
+    successors: %bb.24
+    JMP_1 %bb.24
+
+  bb.23:
+    successors: %bb.24
+    JMP_1 %bb.24
+
+  bb.24:
     liveins: $rbx
     MOV64mr %stack.0, 1, $noreg, 0, $noreg, $rbx :: (store (s64) into %stack.0)
     $rax = MOV64rm %stack.0, 1, $noreg, 0, $noreg :: (load (s64) from %stack.0)
