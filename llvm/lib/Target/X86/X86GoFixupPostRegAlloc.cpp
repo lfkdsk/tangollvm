@@ -18,8 +18,8 @@
 #include "X86InstrInfo.h"
 #include "X86Subtarget.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -42,9 +42,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <cstdint>
-#include <functional>
 #include <iterator>
-#include <set>
 
 #define DEBUG_TYPE "x86-go-fixup-postregalloc"
 
@@ -257,6 +255,24 @@ bool X86GoFixupPostRegAllocPass::rewriteGCWriteBarrier() {
 }
 
 // Runs after StackSlotColoring: negative fixed FIs must never reach LiveStacks.
+//
+// The incoming-value proof used to be a recursive backward walk with a
+// per-query cycle-detection set.  On thrift-generated functions with thousands
+// of blocks it rediscovered the same (block, register) states from every store
+// site, making the pass superlinear (multi-hour llc on aweme/pack/common).
+// It is now a linear forward dataflow computed once per argument register:
+//
+//   * a provenance set holds the physical registers that still carry the
+//     argument register's entry value at the current instruction;
+//   * a full-register COPY forwards the provenance, every other definition
+//     (including regmask clobbers and sub-register writes) destroys it;
+//   * a block entry is proven only when every predecessor proves the same
+//     register, so the block entry state is the intersection of predecessors;
+//   * blocks that can only be reached through a cycle never get an entry state
+//     and keep an empty provenance set, the same conservative rejection as the
+//     old "active node revisited" rule.
+//
+// The accepted/rejected set of spill slots is unchanged; only the proof cost.
 bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
   const Function &F = MF->getFunction();
   auto *Args = F.getMetadata("go.caller.args.area");
@@ -276,6 +292,110 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
   bool Changed = false;
   if (Args->getNumOperands() < 2 || (Args->getNumOperands() - 2) % 4)
     return false;
+
+  using RegVec = SmallVector<Register, 4>;
+  // IncomingStore[MI] is set when MI stores a stack slot from a register that
+  // still holds the current argument register's entry value.  The flow is
+  // rebuilt lazily for every distinct argument register.
+  DenseMap<const MachineInstr *, bool> IncomingStore;
+  Register CachedArg;
+  // Provenance sets at block entry and block exit.  A block appears in
+  // EntryState once its entry proof is assigned, and in ExitState once it has
+  // been processed; the two must stay distinct so a join never intersects an
+  // unprocessed predecessor's default-constructed (empty) state.
+  DenseMap<const MachineBasicBlock *, RegVec> EntryState, ExitState;
+
+  // Apply one instruction to the provenance set.  Mirrors the old backward
+  // step: only a plain full-register physical COPY keeps the value alive,
+  // every other modifying instruction invalidates the overlapping regs.
+  auto Transfer = [&](const MachineInstr &MI, RegVec &State) {
+    auto Copy = TII->isCopyInstr(MI);
+    bool FullCopy = Copy && Copy->Destination->isReg() &&
+                    Copy->Source->isReg() &&
+                    !Copy->Destination->getSubReg() &&
+                    !Copy->Source->getSubReg() &&
+                    Copy->Source->getReg().isPhysical();
+    // A copy can forward provenance into a register not previously tracked,
+    // so copies are inspected even when the destination is outside State.
+    bool SrcProven =
+        FullCopy && is_contained(State, Copy->Source->getReg());
+    // The destination definition invalidates overlapping proven registers.
+    llvm::erase_if(State, [&](Register R) {
+      return MI.modifiesRegister(R, TRI);
+    });
+    if (SrcProven)
+      State.push_back(Copy->Destination->getReg());
+  };
+
+  auto BuildDataFlow = [&](Register ArgReg) {
+    IncomingStore.clear();
+    EntryState.clear();
+    ExitState.clear();
+    CachedArg = ArgReg;
+
+    MachineBasicBlock &Front = MF->front();
+    EntryState[&Front].push_back(ArgReg);
+    SmallVector<const MachineBasicBlock *, 32> Worklist;
+    Worklist.push_back(&Front);
+    while (!Worklist.empty()) {
+      const MachineBasicBlock *B = Worklist.pop_back_val();
+      if (ExitState.count(B))
+        continue;
+      RegVec State = EntryState[B];
+      for (const MachineInstr &MI : *B)
+        Transfer(MI, State);
+      // Inserting the exit state marks B processed; its successors may now
+      // use it in their join intersections.
+      ExitState[B] = State;
+      for (const MachineBasicBlock *Succ : B->successors()) {
+        if (EntryState.count(Succ))
+          continue;
+        // A join gets an entry state only once every predecessor has been
+        // processed (not merely reached); blocks fed by a backedge can never
+        // satisfy this and stay without a state, the same conservative
+        // rejection as the old active-node cycle rule.
+        bool Ready = true;
+        for (const MachineBasicBlock *Pred : Succ->predecessors())
+          if (!ExitState.count(Pred)) {
+            Ready = false;
+            break;
+          }
+        if (!Ready)
+          continue;
+        RegVec Joined;
+        for (const MachineBasicBlock *Pred : Succ->predecessors()) {
+          const RegVec &PredState = ExitState.find(Pred)->second;
+          if (Pred == *Succ->predecessors().begin()) {
+            Joined = PredState;
+            continue;
+          }
+          llvm::erase_if(Joined, [&](Register R) {
+            return !is_contained(PredState, R);
+          });
+        }
+        EntryState[Succ] = std::move(Joined);
+        Worklist.push_back(Succ);
+      }
+    }
+
+    // Second forward walk with point-accurate provenance records the answer
+    // for every stack-slot store.  Blocks without an entry state (cycles,
+    // unreachable blocks) keep an empty provenance set.
+    for (const MachineBasicBlock &MBB : *MF) {
+      RegVec State;
+      if (EntryState.count(&MBB))
+        State = EntryState.find(&MBB)->second;
+      for (const MachineInstr &MI : MBB) {
+        int Slot;
+        unsigned Bytes = 0;
+        Register Src = TII->isStoreToStackSlot(MI, Slot, Bytes);
+        if (Src && is_contained(State, Src))
+          IncomingStore[&MI] = true;
+        Transfer(MI, State);
+      }
+    }
+  };
+
   for (unsigned A = 2; A < Args->getNumOperands(); A += 4) {
     auto Read = [&](unsigned I) {
       return cast<ConstantInt>(cast<ConstantAsMetadata>(
@@ -290,54 +410,19 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
       LiveIn |= TRI->regsOverlap(LI.PhysReg, Reg);
     if (!LiveIn)
       continue;
-    // Prove that Tracked at End still contains this incoming argument.  Walk
-    // backwards through full-register copies and require the proof on every
-    // predecessor of a join.  Cycles are rejected conservatively: accepting
-    // them would require a separate fixed-point proof of the loop backedge.
-    std::set<std::pair<const MachineBasicBlock *, unsigned>> Active;
-    std::function<bool(const MachineBasicBlock *,
-                       MachineBasicBlock::const_instr_iterator, Register)>
-        IsIncoming = [&](const MachineBasicBlock *Block,
-                         MachineBasicBlock::const_instr_iterator End,
-                         Register Tracked) {
-          for (auto It = End; It != Block->instr_begin();) {
-            --It;
-            if (!It->modifiesRegister(Tracked, TRI))
-              continue;
-            auto Copy = TII->isCopyInstr(*It);
-            if (!Copy || !Copy->Destination->isReg() ||
-                !Copy->Source->isReg() ||
-                Copy->Destination->getSubReg() || Copy->Source->getSubReg() ||
-                Copy->Destination->getReg() != Tracked ||
-                !Copy->Source->getReg().isPhysical())
-              return false;
-            Tracked = Copy->Source->getReg();
-          }
-          if (Block == &MF->front())
-            return Tracked == Reg;
-          auto Key = std::make_pair(Block, Tracked.id());
-          if (!Active.insert(Key).second || Block->pred_empty())
-            return false;
-          for (const MachineBasicBlock *Pred : Block->predecessors())
-            if (!IsIncoming(Pred, Pred->instr_end(), Tracked)) {
-              Active.erase(Key);
-              return false;
-            }
-          Active.erase(Key);
-          return true;
-        };
+    if (CachedArg != Reg)
+      BuildDataFlow(Reg);
     MachineInstr *Spill = nullptr;
     int FI = 0;
     unsigned SpillBytes = 0;
     // RA may sink an entry spill onto one side of an entry branch (notably
-    // main.handle). Follow only single-predecessor chains, proving the source
-    // unchanged on the entire path from entry. Do not cross joins or cycles.
+    // main.handle).  The precomputed flow encodes the whole-CFG proof.
     for (auto &MBB : *MF) {
       for (auto &MI : MBB) {
         int Slot;
         unsigned Bytes = 0;
         Register Src = TII->isStoreToStackSlot(MI, Slot, Bytes);
-        if (!Src || !IsIncoming(&MBB, MI.getIterator(), Src))
+        if (!Src || !IncomingStore.count(&MI))
           continue;
         Spill = &MI;
         FI = Slot;
@@ -369,7 +454,6 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
     // Accept only plain full-slot accesses. In particular, reject address-taking
     // and every other store, including slots merged by stack-slot coloring.
     bool Legal = true;
-    SmallPtrSet<const MachineInstr *, 4> IncomingStores;
     for (auto &MBB : *MF) {
       for (auto &MI : MBB) {
         bool Ref = false;
@@ -386,10 +470,8 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
         unsigned StoreBytes = 0;
         Register StoreSrc = TII->isStoreToStackSlot(MI, StoreFI, StoreBytes);
         if (StoreSrc && StoreFI == FI && StoreBytes == MFI.getObjectSize(FI) &&
-            IsIncoming(&MBB, MI.getIterator(), StoreSrc)) {
-          IncomingStores.insert(&MI);
+            IncomingStore.count(&MI))
           continue;
-        }
         int LoadFI;
         if (MI.mayStore() || !TII->isLoadFromStackSlot(MI, LoadFI) ||
             LoadFI != FI)
@@ -410,7 +492,7 @@ bool X86GoFixupPostRegAllocPass::reuseArgSpillArea() {
             MO.setIndex(NewFI);
         SmallVector<MachineMemOperand *, 2> MemRefs;
         bool TagSpill = SpillBytes == Size && F.getMetadata("go.arginfo") &&
-                        IncomingStores.contains(&MI);
+                        IncomingStore.contains(&MI);
         for (auto *MMO : MI.memoperands()) {
           if (auto *PSV = dyn_cast_or_null<FixedStackPseudoSourceValue>(
                   MMO->getPseudoValue())) {
