@@ -1,0 +1,52 @@
+# REQUIRES: x86-registered-target
+# RUN: split-file %s %t
+# RUN: llvm-profgen --binary=%S/Inputs/go-abi0.perfbin --unsymbolized-profile=%t/sample --use-offset=0 --format=text --output=%t/profile
+# RUN: FileCheck %s --input-file=%t/profile
+
+# The bodies at 0x401000 and 0x401010 have the same DWARF name.
+# A call from the wrapper must keep the ABI0 target and its count.
+# CHECK:      pkg.work.abi0:40:7
+# CHECK-NEXT:  1: 40
+# CHECK:      pkg.work:25:0
+# CHECK:       1: 7 pkg.work.abi0:7
+
+# To regenerate Inputs/go-abi0.perfbin:
+# split-file go-abi0.test /tmp/go-abi0
+# llc -filetype=obj /tmp/go-abi0/fixture.ll -o /tmp/go-abi0/fixture.o
+# ld -e pkg.work -Ttext=0x401000 /tmp/go-abi0/fixture.o -o Inputs/go-abi0.perfbin
+
+#--- fixture.ll
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @pkg.work.abi0() align 16 !dbg !4 {
+  ret void, !dbg !7
+}
+
+define void @pkg.work() align 16 !dbg !5 {
+  notail call void @pkg.work.abi0(), !dbg !8
+  ret void, !dbg !9
+}
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!10, !11}
+!0 = distinct !DICompileUnit(language: DW_LANG_Go, file: !1, producer: "Go",
+                             isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+!1 = !DIFile(filename: "fixture.go", directory: "/")
+!2 = !DISubroutineType(types: !3)
+!3 = !{}
+!4 = distinct !DISubprogram(name: "pkg.work", scope: !1, file: !1, line: 10,
+                             type: !2, scopeLine: 10, spFlags: DISPFlagDefinition, unit: !0)
+!5 = distinct !DISubprogram(name: "pkg.work", scope: !1, file: !1, line: 20,
+                             type: !2, scopeLine: 20, spFlags: DISPFlagDefinition, unit: !0)
+!7 = !DILocation(line: 11, column: 1, scope: !4)
+!8 = !DILocation(line: 21, column: 1, scope: !5)
+!9 = !DILocation(line: 22, column: 1, scope: !5)
+!10 = !{i32 2, !"Dwarf Version", i32 4}
+!11 = !{i32 2, !"Debug Info Version", i32 3}
+
+#--- sample
+2
+401000-401000:40
+401011-401011:5
+1
+401011->401000:7

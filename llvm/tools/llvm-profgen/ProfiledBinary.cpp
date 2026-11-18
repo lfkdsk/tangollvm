@@ -230,15 +230,27 @@ void ProfiledBinary::load() {
   // Find the preferred load address for text sections.
   setPreferredTextSegmentAddresses(Obj);
 
+  // Go's DWARF can omit the ABI suffix from assembly function names.
+  // Keep the executable's ELF names available when reading their DIEs.
+  DenseMap<uint64_t, StringRef> ABI0Symbols;
+  if (isa<ELFObjectFileBase>(Obj)) {
+    for (const SymbolRef &Symbol : Obj->symbols()) {
+      StringRef Name = unwrapOrError(Symbol.getName(), Path);
+      if (Name.ends_with(".abi0") &&
+          unwrapOrError(Symbol.getType(), Path) == SymbolRef::ST_Function)
+        ABI0Symbols.try_emplace(unwrapOrError(Symbol.getAddress(), Path), Name);
+    }
+  }
+
   // Load debug info of subprograms from DWARF section.
   // If path of debug info binary is specified, use the debug info from it,
   // otherwise use the debug info from the executable binary.
   if (!DebugBinaryPath.empty()) {
     OwningBinary<Binary> DebugPath =
         unwrapOrError(createBinary(DebugBinaryPath), DebugBinaryPath);
-    loadSymbolsFromDWARF(*cast<ObjectFile>(DebugPath.getBinary()));
+    loadSymbolsFromDWARF(*cast<ObjectFile>(DebugPath.getBinary()), ABI0Symbols);
   } else {
-    loadSymbolsFromDWARF(*cast<ObjectFile>(&ExeBinary));
+    loadSymbolsFromDWARF(*Obj, ABI0Symbols);
   }
 
   DisassembleFunctionSet.insert(DisassembleFunctions.begin(),
@@ -780,7 +792,12 @@ void ProfiledBinary::populateElfSymbolAddressList(
   }
 }
 
-void ProfiledBinary::loadSymbolsFromDWARFUnit(DWARFUnit &CompilationUnit) {
+void ProfiledBinary::loadSymbolsFromDWARFUnit(
+    DWARFUnit &CompilationUnit,
+    const DenseMap<uint64_t, StringRef> &ABI0Symbols) {
+  const bool IsGo = dwarf::toUnsigned(
+                        CompilationUnit.getUnitDIE().find(dwarf::DW_AT_language),
+                        0) == dwarf::DW_LANG_Go;
   for (const auto &DieInfo : CompilationUnit.dies()) {
     llvm::DWARFDie Die(&CompilationUnit, &DieInfo);
 
@@ -797,16 +814,6 @@ void ProfiledBinary::loadSymbolsFromDWARFUnit(DWARFUnit &CompilationUnit) {
       continue;
     const DWARFAddressRangesVector &Ranges = RangesOrError.get();
 
-    if (Ranges.empty())
-      continue;
-
-    // Different DWARF symbols can have same function name, search or create
-    // BinaryFunction indexed by the name.
-    auto Ret = BinaryFunctions.emplace(Name, BinaryFunction());
-    auto &Func = Ret.first->second;
-    if (Ret.second)
-      Func.FuncName = Ret.first->first;
-
     for (const auto &Range : Ranges) {
       uint64_t StartAddress = Range.LowPC;
       uint64_t EndAddress = Range.HighPC;
@@ -814,6 +821,20 @@ void ProfiledBinary::loadSymbolsFromDWARFUnit(DWARFUnit &CompilationUnit) {
       if (EndAddress <= StartAddress ||
           StartAddress < getPreferredBaseAddress())
         continue;
+
+      StringRef RangeName = Name;
+      if (IsGo) {
+        StringRef ELFName = ABI0Symbols.lookup(StartAddress);
+        if (!ELFName.empty() && ELFName.drop_back(sizeof(".abi0") - 1) == Name)
+          RangeName = ELFName;
+      }
+
+      // Different DWARF symbols can share a function name. The ABI0 body
+      // and the wrapper must have distinct ranges even when their DIEs agree.
+      auto Ret = BinaryFunctions.try_emplace(RangeName.str());
+      auto &Func = Ret.first->second;
+      if (Ret.second)
+        Func.FuncName = Ret.first->first;
 
       // We may want to know all ranges for one function. Here group the
       // ranges and store them into BinaryFunction.
@@ -831,20 +852,21 @@ void ProfiledBinary::loadSymbolsFromDWARFUnit(DWARFUnit &CompilationUnit) {
           WithColor::warning()
               << "Duplicated symbol start address at "
               << format("%8" PRIx64, StartAddress) << " "
-              << R.first->second.getFuncName() << " and " << Name << "\n";
+              << R.first->second.getFuncName() << " and " << RangeName << "\n";
       }
     }
   }
 }
 
-void ProfiledBinary::loadSymbolsFromDWARF(ObjectFile &Obj) {
+void ProfiledBinary::loadSymbolsFromDWARF(
+    ObjectFile &Obj, const DenseMap<uint64_t, StringRef> &ABI0Symbols) {
   auto DebugContext = llvm::DWARFContext::create(
       Obj, DWARFContext::ProcessDebugRelocations::Process, nullptr, DWPPath);
   if (!DebugContext)
     exitWithError("Error creating the debug info context", Path);
 
   for (const auto &CompilationUnit : DebugContext->compile_units())
-    loadSymbolsFromDWARFUnit(*CompilationUnit);
+    loadSymbolsFromDWARFUnit(*CompilationUnit, ABI0Symbols);
 
   // Handles DWO sections that can either be in .o, .dwo or .dwp files.
   uint32_t NumOfDWOMissing = 0;
@@ -864,7 +886,7 @@ void ProfiledBinary::loadSymbolsFromDWARF(ObjectFile &Obj) {
         }
         continue;
       }
-      loadSymbolsFromDWARFUnit(*DWOCU);
+      loadSymbolsFromDWARFUnit(*DWOCU, ABI0Symbols);
     }
   }
 
@@ -918,6 +940,8 @@ SampleContextFrameVector ProfiledBinary::symbolize(const InstructionPointer &IP,
       Symbolizer->symbolizeInlinedCode(SymbolizerPath.str(), Addr),
       SymbolizerPath);
 
+  // Only the outer frame describes the machine function at this address.
+  FuncRange *Range = findFuncRange(IP.Address);
   SampleContextFrameVector CallStack;
   for (int32_t I = InlineStack.getNumberOfFrames() - 1; I >= 0; I--) {
     const auto &CallerFrame = InlineStack.getFrame(I);
@@ -926,6 +950,10 @@ SampleContextFrameVector ProfiledBinary::symbolize(const InstructionPointer &IP,
       break;
 
     StringRef FunctionName(CallerFrame.FunctionName);
+    if (CallStack.empty() && Range &&
+        Range->getFuncName().ends_with(".abi0") &&
+        Range->getFuncName().drop_back(sizeof(".abi0") - 1) == FunctionName)
+      FunctionName = Range->getFuncName();
     if (UseCanonicalFnName)
       FunctionName = FunctionSamples::getCanonicalFnName(FunctionName);
 

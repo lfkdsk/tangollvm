@@ -323,10 +323,13 @@ class ProfiledBinary {
   symbolize::LLVMSymbolizer::Options getSymbolizerOpts() const;
 
   // Load debug info of subprograms from DWARF section.
-  void loadSymbolsFromDWARF(ObjectFile &Obj);
+  void loadSymbolsFromDWARF(ObjectFile &Obj,
+                            const DenseMap<uint64_t, StringRef> &ABI0Symbols);
 
   // Load debug info from DWARF unit.
-  void loadSymbolsFromDWARFUnit(DWARFUnit &CompilationUnit);
+  void loadSymbolsFromDWARFUnit(
+      DWARFUnit &CompilationUnit,
+      const DenseMap<uint64_t, StringRef> &ABI0Symbols);
 
   // Create elf symbol to its start address mapping.
   void populateElfSymbolAddressList(const ELFObjectFileBase *O);
