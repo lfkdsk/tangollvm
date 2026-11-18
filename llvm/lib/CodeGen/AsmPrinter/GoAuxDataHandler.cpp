@@ -584,6 +584,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
   }
 
   const TargetInstrInfo &TII = *Asm->MF->getSubtarget().getInstrInfo();
+  const TargetRegisterInfo *TRI = Asm->MF->getSubtarget().getRegisterInfo();
   SmallDenseSet<const MachineBasicBlock*> MoreStackBlocks;
 
   if (!MF->getFunction().hasFnAttribute("go-leaf")) {
@@ -599,20 +600,78 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
 
     MachineBasicBlock *AllocBB = nullptr, *CheckBB2 = nullptr;
     bool BigStack = Type == "big";
+    bool DuplicatedRetry = false;
     auto *Succ0 = *CheckBB->successors().begin();
     auto *Succ1 = *(CheckBB->successors().begin() + 1);
+    auto IsDuplicatedMoreStackRetry =
+        [&](const MachineBasicBlock *CandAlloc,
+            const MachineBasicBlock *BodyBB) -> bool {
+      if (BigStack || CandAlloc == CheckBB || BodyBB == CheckBB ||
+          CandAlloc == BodyBB)
+        return false;
+      if (CandAlloc->succ_size() != 2 || !CandAlloc->isSuccessor(CandAlloc) ||
+          !CandAlloc->isSuccessor(BodyBB))
+        return false;
+
+      SmallVector<const MachineInstr *, 4> CheckInsts;
+      for (const auto &MI : *CheckBB) {
+        if (MI.isMetaInstruction() || MI.isTerminator())
+          continue;
+        CheckInsts.push_back(&MI);
+      }
+      if (CheckInsts.empty() || !CheckInsts.back()->isCompare())
+        return false;
+
+      SmallVector<const MachineInstr *, 16> AllocInsts;
+      std::optional<size_t> MoreStackIdx;
+      bool HasTerm = false;
+      for (const auto &MI : *CandAlloc) {
+        if (MI.isMetaInstruction())
+          continue;
+        if (MI.isTerminator()) {
+          HasTerm = true;
+          for (const auto &MO : MI.operands())
+            if (MO.isMBB() && MO.getMBB() != CandAlloc && MO.getMBB() != BodyBB)
+              return false;
+          continue;
+        }
+        if (TangoLLVMCodeGen::isMoreStackCall(MI)) {
+          if (MoreStackIdx.has_value())
+            return false;
+          MoreStackIdx = AllocInsts.size();
+        } else if (MI.isCall()) {
+          return false;
+        }
+        AllocInsts.push_back(&MI);
+      }
+      if (!HasTerm || !MoreStackIdx.has_value())
+        return false;
+      if (AllocInsts.size() - (*MoreStackIdx + 1) < CheckInsts.size())
+        return false;
+      size_t TailStart = AllocInsts.size() - CheckInsts.size();
+      for (size_t I = 0; I < CheckInsts.size(); ++I)
+        if (!AllocInsts[TailStart + I]->isIdenticalTo(*CheckInsts[I]))
+          return false;
+      return true;
+    };
+
     if (Succ0->getSingleSuccessor() == CheckBB) {
       AllocBB = Succ0;
       if (BigStack)
         CheckBB2 = Succ1;
-    } else {
-      if (Succ1->getSingleSuccessor() != CheckBB) {
-        MarkAllUnsafe();
-        return;
-      }
+    } else if (Succ1->getSingleSuccessor() == CheckBB) {
       AllocBB = Succ1;
       if (BigStack)
         CheckBB2 = Succ0;
+    } else if (IsDuplicatedMoreStackRetry(Succ0, Succ1)) {
+      AllocBB = Succ0;
+      DuplicatedRetry = true;
+    } else if (IsDuplicatedMoreStackRetry(Succ1, Succ0)) {
+      AllocBB = Succ1;
+      DuplicatedRetry = true;
+    } else {
+      MarkAllUnsafe();
+      return;
     }
 
     MoreStackBlocks.insert(CheckBB);
@@ -640,7 +699,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
     for (auto &MI : *AllocBB) {
       if (MI.isMetaInstruction())
         continue;
-      if (MI.isTerminator())
+      if (!DuplicatedRetry && MI.isTerminator())
         break;
       if (MI.getOpcode() == TII.getNop().getOpcode())
         Found = true;
@@ -682,12 +741,15 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
     SmallDenseSet<const MachineInstr*> MatchedBarrierCmps;
     for (const auto &MBB : *MF) {
       SmallDenseSet<const MachineInstr*> MIs;
+      SmallVector<Register, 2> BufferRegs;
       bool FoundGCWrite = false;
+      bool SlowPathClean = true;
       for (const MachineInstr &MI : MBB) {
         if (MI.isMetaInstruction())
           continue;
         auto [WB, Enable] = IsBarrierCmp(&MI);
         if (WB) {
+          SlowPathClean = false;
           if (Enable)
             BarrierCmps.insert(&MI);
           else {
@@ -703,16 +765,44 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
         }
         if (FoundGCWrite) {
           UnsafePoints.insert(&MI);
+          if (MI.isCall()) {
+            auto &CalleeMO = MI.getOperand(0);
+            if (!GetMOName(&CalleeMO).starts_with("runtime.gcWriteBarrier")) {
+              SlowPathClean = false;
+            } else {
+              for (const auto &MO : MI.operands())
+                if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical() &&
+                    !MI.readsRegister(MO.getReg(), TRI) &&
+                    !llvm::is_contained(BufferRegs, MO.getReg()))
+                  BufferRegs.push_back(MO.getReg());
+            }
+          } else if (MI.mayStore()) {
+            if (!llvm::any_of(BufferRegs, [&](Register Reg) {
+                  return MI.readsRegister(Reg, TRI);
+                }))
+              SlowPathClean = false;
+          } else if (MI.hasUnmodeledSideEffects()) {
+            SlowPathClean = false;
+          }
           continue;
         }
 
+        if (MI.mayStore() || MI.hasUnmodeledSideEffects())
+          SlowPathClean = false;
         MIs.insert(&MI);
         if (!MI.isCall())
           continue;
         auto &CalleeMO = MI.getOperand(0);
-        if (!GetMOName(&CalleeMO).starts_with("runtime.gcWriteBarrier"))
+        if (!GetMOName(&CalleeMO).starts_with("runtime.gcWriteBarrier")) {
+          SlowPathClean = false;
           continue;
+        }
 
+        for (const auto &MO : MI.operands())
+          if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical() &&
+              !MI.readsRegister(MO.getReg(), TRI) &&
+              !llvm::is_contained(BufferRegs, MO.getReg()))
+            BufferRegs.push_back(MO.getReg());
         UnsafePoints.insert(MIs.begin(), MIs.end());
         FoundGCWrite = true;
       }
@@ -726,6 +816,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       SmallDenseSet<const MachineBasicBlock *> Visited;
       bool SearchFailed = Pending.empty();
       bool FoundAnyBarrier = false;
+      bool FastPathClean = true;
       while (!Pending.empty() && !SearchFailed) {
         const MachineBasicBlock *CurrMBB = Pending.pop_back_val();
         if (!Visited.insert(CurrMBB).second)
@@ -746,6 +837,16 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
         if (FnUnsafe) {
           MarkAllUnsafe();
           return;
+        }
+
+        bool SeenStart = FoundBarrier == nullptr;
+        for (const auto &I : *CurrMBB) {
+          if (&I == FoundBarrier)
+            SeenStart = true;
+          if (!SeenStart || I.isMetaInstruction())
+            continue;
+          if (I.mayStore() || I.isCall() || I.hasUnmodeledSideEffects())
+            FastPathClean = false;
         }
 
         if (FoundBarrier) {
@@ -770,14 +871,68 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       }
       if (Candidates.empty())
         continue;
+      auto FindBarrierSuccEnd =
+          [&](const MachineBasicBlock *Succ) -> const MachineInstr * {
+        if (Succ == &MBB || Candidates.contains(Succ))
+          return nullptr;
+        if (!SlowPathClean || !FastPathClean || BufferRegs.empty())
+          return nullptr;
+        if (MBB.getSingleSuccessor() != Succ || Succ->pred_size() < 2)
+          return nullptr;
+        for (const auto *Pred : Succ->predecessors())
+          if (Pred != &MBB && !Candidates.contains(Pred))
+            return nullptr;
+        for (Register Reg : BufferRegs)
+          for (const auto &LI : Succ->liveins())
+            if (TRI->regsOverlap(LI.PhysReg, Reg))
+              return nullptr;
+
+        SmallDenseSet<Register, 2> RedefinedBufferRegs;
+        const MachineInstr *LastStore = nullptr;
+        for (const auto &I : *Succ) {
+          if (I.isMetaInstruction())
+            continue;
+          for (Register Reg : BufferRegs) {
+            if (!RedefinedBufferRegs.contains(Reg)) {
+              if (I.readsRegister(Reg, TRI))
+                return nullptr;
+              if (I.modifiesRegister(Reg, TRI))
+                RedefinedBufferRegs.insert(Reg);
+            }
+          }
+          if (I.isCall() || IsBarrierCmp(&I).first || I.isReturn() ||
+              I.getFlag(MachineInstr::FrameDestroy) ||
+              I.hasUnmodeledSideEffects())
+            return nullptr;
+          if (I.mayStore())
+            LastStore = &I;
+        }
+        if (!LastStore)
+          return nullptr;
+        bool AfterLastStore = false;
+        for (const auto &I : *Succ) {
+          if (I.isMetaInstruction())
+            continue;
+          if (&I == LastStore) {
+            AfterLastStore = true;
+            continue;
+          }
+          if (AfterLastStore && (I.mayLoad() || I.mayStore()))
+            return nullptr;
+        }
+        return LastStore;
+      };
       for (auto *CurrMBB : Candidates) {
         for (auto *Succ : CurrMBB->successors()) {
           if (!MarkedSuccBBs.insert(Succ).second)
             continue;
+          const MachineInstr *EndStore = FindBarrierSuccEnd(Succ);
           for (auto &I : *Succ) {
             if (I.isMetaInstruction())
               continue;
             UnsafePoints.insert(&I);
+            if (&I == EndStore)
+              break;
           }
         }
       }
