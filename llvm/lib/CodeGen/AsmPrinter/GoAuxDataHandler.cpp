@@ -966,6 +966,51 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
   }
 
   {
+    // UPF2: scoped non-preemptibility for inlined go.allunsafe callees. The
+    // IR inliner (TangoLLVM::updateMetadataForInlining) records their
+    // DISubprogram names in function metadata go.allunsafe.inline instead of
+    // copying the callee's whole-function go.allunsafe attribute onto a
+    // preemptible caller. The scope is resolved at emission time, when every
+    // machine instruction is final, so the marks survive post-regalloc
+    // instruction replacement; the caller's own instructions, whose debug
+    // location has no matching inlined-at scope, stay preemptible.
+    MDNode *InlineMD = MF->getFunction().getMetadata(
+        TangoLLVM::GoAllUnsafeInlineMetadataName);
+    if (InlineMD && InlineMD->getNumOperands() > 0) {
+      SmallDenseSet<StringRef, 8> UnsafeCallees;
+      for (const MDOperand &Op : InlineMD->operands())
+        if (const auto *S = dyn_cast<MDString>(Op.get()))
+          UnsafeCallees.insert(S->getString());
+
+      SmallDenseSet<StringRef, 8> Observed;
+      for (const MachineBasicBlock &MBB : *MF) {
+        for (const MachineInstr &MI : MBB) {
+          if (MI.isMetaInstruction())
+            continue;
+          for (const DILocation *L = MI.getDebugLoc(); L;
+               L = L->getInlinedAt()) {
+            const DISubprogram *SP = findSubprogramFromScope(L->getScope());
+            if (SP && UnsafeCallees.contains(SP->getName())) {
+              UnsafePoints.insert(&MI);
+              Observed.insert(SP->getName());
+              break;
+            }
+          }
+        }
+      }
+
+      // Conservative fallback: if a recorded callee has no observable scope
+      // (debug info stripped or the whole body folded away), scoped marking
+      // cannot prove the inlined body is fully covered. Restore the legacy
+      // whole-function policy rather than leave allunsafe code preemptible.
+      if (Observed.size() != UnsafeCallees.size()) {
+        MarkAllUnsafe();
+        return;
+      }
+    }
+  }
+
+  {
     if (MF->getFunction().hasMetadata("go.has.unsafepoint")) {
       // find unsafe point marked by go front end, which is opconvert now.
       DenseSet<const MachineInstr *> Flooded;

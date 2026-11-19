@@ -701,19 +701,67 @@ void TangoLLVM::updateGoCalleeAreaSize(Function &F, int64_t Size) {
                 MDNode::get(F.getContext(), {NewSize, NewSize}));
 }
 
+// Record one callee identity on the caller's go.allunsafe.inline list. The
+// backend keeps only the inlined scope of such callees non-preemptible.
+// Names are de-duplicated. The DISubprogram name is preferred over the IR
+// symbol name: MachineInstr debug locations identify inlined scopes by
+// DISubprogram, and LTO renaming may change the IR symbol while the debug
+// info name remains stable.
+static void recordInlinedAllUnsafe(Function *Caller, StringRef Name) {
+  if (Name.empty())
+    return;
+
+  LLVMContext &Ctx = Caller->getContext();
+  SmallVector<Metadata *, 8> Ops;
+  if (MDNode *Old = Caller->getMetadata(
+          TangoLLVM::GoAllUnsafeInlineMetadataName)) {
+    for (Metadata *Op : Old->operands()) {
+      if (auto *S = dyn_cast<MDString>(Op))
+        if (S->getString() == Name)
+          return; // already recorded
+      Ops.push_back(Op);
+    }
+  }
+  Ops.push_back(MDString::get(Ctx, Name));
+  Caller->setMetadata(TangoLLVM::GoAllUnsafeInlineMetadataName,
+                      MDNode::get(Ctx, Ops));
+}
+
 // update go.callee.args.area metadata when inlining
 void TangoLLVM::updateMetadataForInlining(Function *Callee, Function *Caller) {
   if (Callee->hasMetadata("go.opendefer")) {
     report_fatal_error("cannot inline opendefer");
   }
 
-  if (Callee->hasFnAttribute("go.allunsafe")) {
-    auto UnsafeValue = Callee->getFnAttribute("go.allunsafe").getValueAsString();
-    if (UnsafeValue == "CompilingRuntime") {
-      // if the callee is 'CompilingRuntime' function but all instructions are safe,
-      // don't change caller's attribute
-    } else {
-      Caller->addFnAttr("go.allunsafe", UnsafeValue);
+  // UPF2: a go.allunsafe callee must no longer make the whole caller
+  // non-preemptible. gc's liveness rule (plive.go IsUnsafe) is per physical
+  // function and never propagates through inlining.
+  //
+  // A caller that carries go.allunsafe itself (runtime/nosplit function, or
+  // a build with async preemption disabled) stays whole-unsafe: there is
+  // nothing to scope. Otherwise record the callee so the backend can mark
+  // only its inlined instructions as non-preemptible while the caller's own
+  // code remains preemptible. Both emitted values
+  // ("CompilingRuntimeOrNoSplit" and "AsyncPreemptDisabled") take this path;
+  // the previous "CompilingRuntime" exemption matched a string the frontend
+  // never emits and was therefore dead.
+  if (!Caller->hasFnAttribute("go.allunsafe")) {
+    if (Callee->hasFnAttribute("go.allunsafe")) {
+      StringRef Name;
+      if (const DISubprogram *SP = Callee->getSubprogram())
+        Name = SP->getName();
+      if (Name.empty())
+        Name = Callee->getName();
+      recordInlinedAllUnsafe(Caller, Name);
+    }
+
+    // Nested inlining: propagate scopes recorded on an intermediate callee
+    // so transitive allunsafe bodies stay covered.
+    if (MDNode *Nested =
+            Callee->getMetadata(GoAllUnsafeInlineMetadataName)) {
+      for (Metadata *Op : Nested->operands())
+        if (auto *S = dyn_cast<MDString>(Op))
+          recordInlinedAllUnsafe(Caller, S->getString());
     }
   }
 

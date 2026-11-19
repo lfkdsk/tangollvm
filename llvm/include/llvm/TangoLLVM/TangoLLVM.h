@@ -67,6 +67,15 @@ enum class GoAdHocABI {
 class TangoLLVM {
 
 public:
+  // Function-level metadata holding the DISubprogram names of go.allunsafe
+  // callees that were inlined into a function which is not itself
+  // runtime/nosplit. Instead of propagating the callee's whole-function
+  // go.allunsafe attribute onto the caller, the inliner records the callee
+  // identities here and the backend marks only their inlined instruction
+  // scopes as non-preemptible, keeping the caller's own code preemptible.
+  // Nested inlining merges lists so that transitive scopes stay covered.
+  static constexpr const char GoAllUnsafeInlineMetadataName[] =
+      "go.allunsafe.inline";
 
   static bool isGoPanicBounds(StringRef Name) {
     if (!Name.consume_front("runtime."))
