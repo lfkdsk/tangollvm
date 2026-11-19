@@ -42,6 +42,18 @@ using namespace llvm;
 
 #define DEBUG_TYPE "go-unsafe-point"
 STATISTIC(NumBarrierFallbacks, "Functions made all-unsafe after barrier search failure");
+STATISTIC(NumPolicyAttrUnsafe,
+          "Functions made all-unsafe by the go.allunsafe policy attribute");
+STATISTIC(NumPolicyNoSplitUnsafe,
+          "Functions made all-unsafe as non-leaf go-no-split");
+STATISTIC(NumStackTopologyFallbacks,
+          "Functions made all-unsafe after morestack block topology failure");
+STATISTIC(NumBarrierCmpFallbacks,
+          "Functions made all-unsafe after an unmatched barrier comparison");
+STATISTIC(NumInlineScopeFallbacks,
+          "Functions made all-unsafe after an unobservable inlined unsafe scope");
+STATISTIC(NumPrunedInlineScopes,
+          "Inlined unsafe-scope records pruned because the body folded before codegen");
 
 static cl::opt<bool> TangoLLVMLTO("tangollvm-lto", cl::Hidden, cl::init(false));
 
@@ -54,6 +66,12 @@ static cl::opt<bool> DebugUnsafePoint("go-debug-unsafe-point",
 static cl::opt<bool> StrictUnsafePoint("go-strict-unsafe-point",
                                       cl::Hidden,
                                       cl::init(false));
+// UP3: emit one "GoUnsafeFallback <reason> <function>" line per whole-function
+// unsafe decision, so production-scale builds can be classified by reason.
+// Debug-only; no effect on code generation or PCDATA.
+static cl::opt<bool>
+    DebugUnsafeFallback("go-debug-unsafe-fallback", cl::Hidden,
+                        cl::init(false));
 
 // Any negative value would be OK because no index should be negative.
 const int32_t DeferReturnStackMapIndexPlaceholder = -1000;
@@ -530,10 +548,14 @@ static std::pair<bool, bool> IsBarrierCmp(const MachineInstr* MI) {
   // or
   // %reg = move runtime.writeBarrier.enabled
   // test %reg
+  // or the ThinLTO split form, where the enabled-flag load stays in a
+  // predecessor and the TEST lives in the check block:
+  // %reg = mov runtime.writeBarrier.enabled   ; MOV*rm memory load
   const MachineOperand *MO = nullptr;
   if (MI->isCompare() && MI->getNumOperands() > 3) {
     MO = &MI->getOperand(3);
-  } else if (MI->isMoveReg() && MI->getNumOperands() > 4) {
+  } else if ((MI->isMoveReg() || MI->mayLoad()) &&
+             MI->getNumOperands() > 4) {
     MO = &MI->getOperand(4);
   }
   if (MO) {
@@ -576,10 +598,22 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
     if (DebugUnsafePoint)
       dbgs() << "GO-GC-STATS allunsafe " << MF->getName() << "\n";
   };
-
-  if (MF->getFunction().hasFnAttribute("go.allunsafe") ||
-      (MF->getFunction().hasFnAttribute("go-no-split") && !MF->getFunction().hasFnAttribute("go-leaf"))) {
+  // UP3: record why the whole function is marked unsafe.
+  auto Fallback = [&](StringRef Reason, Statistic &Counter) {
+    ++Counter;
+    if (DebugUnsafeFallback)
+      errs() << "GoUnsafeFallback\t" << Reason << '\t' << MF->getName()
+             << '\n';
     MarkAllUnsafe();
+  };
+
+  if (MF->getFunction().hasFnAttribute("go.allunsafe")) {
+    Fallback("policy-attr", NumPolicyAttrUnsafe);
+    return;
+  }
+  if (MF->getFunction().hasFnAttribute("go-no-split") &&
+      !MF->getFunction().hasFnAttribute("go-leaf")) {
+    Fallback("policy-nosplit", NumPolicyNoSplitUnsafe);
     return;
   }
 
@@ -670,7 +704,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       AllocBB = Succ1;
       DuplicatedRetry = true;
     } else {
-      MarkAllUnsafe();
+      Fallback("stack-topology", NumStackTopologyFallbacks);
       return;
     }
 
@@ -863,10 +897,9 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       }
 
       if (SearchFailed || !FoundAnyBarrier) {
-        ++NumBarrierFallbacks;
         if (DebugUnsafePoint)
           dbgs() << "Go unsafe-point barrier fallback: " << MF->getName() << "\n";
-        MarkAllUnsafe();
+        Fallback("barrier-search", NumBarrierFallbacks);
         return;
       }
       if (Candidates.empty())
@@ -951,7 +984,7 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
                    << ", at BB: " << MI->getParent()->getName() << "\n";
             MF->print(dbgs());
           }
-          MarkAllUnsafe();
+          Fallback("barrier-cmp", NumBarrierCmpFallbacks);
           return;
         } else {
           ReverseMarkBarrierInBlock(MBB, UnsafePoints, [&](auto *){});
@@ -982,30 +1015,72 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
         if (const auto *S = dyn_cast<MDString>(Op.get()))
           UnsafeCallees.insert(S->getString());
 
-      SmallDenseSet<StringRef, 8> Observed;
-      for (const MachineBasicBlock &MBB : *MF) {
-        for (const MachineInstr &MI : MBB) {
-          if (MI.isMetaInstruction())
-            continue;
-          for (const DILocation *L = MI.getDebugLoc(); L;
+      // UP3: a recorded callee whose inlined body was folded away before
+      // codegen has no IR instruction carrying its scope and therefore cannot
+      // own any final machine instruction. Its non-preemptibility requirement
+      // is vacuous, so prune the record instead of falling back to the
+      // whole-function policy. Names present in IR scopes but unobservable at
+      // the machine level (lost debug locations) are retained and still trip
+      // the Observed check below, preserving the UPF2 conservative fallback.
+      //
+      // A name's absence is only evidence of folding when the function
+      // actually carries debug locations: with debug info stripped entirely,
+      // every name looks absent although the inlined instructions still
+      // exist. In that case prune nothing and let the Observed check restore
+      // the whole-function policy.
+      SmallDenseSet<StringRef, 8> IRScopes;
+      bool HasAnyDebugLoc = false;
+      for (const BasicBlock &BB : MF->getFunction())
+        for (const Instruction &I : BB) {
+          if (!HasAnyDebugLoc && I.getDebugLoc())
+            HasAnyDebugLoc = true;
+          for (const DILocation *L = I.getDebugLoc(); L;
                L = L->getInlinedAt()) {
             const DISubprogram *SP = findSubprogramFromScope(L->getScope());
-            if (SP && UnsafeCallees.contains(SP->getName())) {
-              UnsafePoints.insert(&MI);
-              Observed.insert(SP->getName());
-              break;
-            }
+            if (SP)
+              IRScopes.insert(SP->getName());
           }
+        }
+      if (HasAnyDebugLoc) {
+        SmallVector<StringRef, 8> FoldedScopes;
+        for (StringRef Name : UnsafeCallees)
+          if (!IRScopes.contains(Name))
+            FoldedScopes.push_back(Name);
+        for (StringRef Name : FoldedScopes) {
+          ++NumPrunedInlineScopes;
+          if (DebugUnsafeFallback)
+            errs() << "GoUnsafeScopePruned\t" << MF->getName() << '\t'
+                   << Name << '\n';
+          UnsafeCallees.erase(Name);
         }
       }
 
-      // Conservative fallback: if a recorded callee has no observable scope
-      // (debug info stripped or the whole body folded away), scoped marking
-      // cannot prove the inlined body is fully covered. Restore the legacy
-      // whole-function policy rather than leave allunsafe code preemptible.
-      if (Observed.size() != UnsafeCallees.size()) {
-        MarkAllUnsafe();
-        return;
+      if (!UnsafeCallees.empty()) {
+        SmallDenseSet<StringRef, 8> Observed;
+        for (const MachineBasicBlock &MBB : *MF) {
+          for (const MachineInstr &MI : MBB) {
+            if (MI.isMetaInstruction())
+              continue;
+            for (const DILocation *L = MI.getDebugLoc(); L;
+                 L = L->getInlinedAt()) {
+              const DISubprogram *SP = findSubprogramFromScope(L->getScope());
+              if (SP && UnsafeCallees.contains(SP->getName())) {
+                UnsafePoints.insert(&MI);
+                Observed.insert(SP->getName());
+                break;
+              }
+            }
+          }
+        }
+
+        // Conservative fallback: if a surviving recorded callee has no
+        // observable machine scope (debug info stripped), scoped marking
+        // cannot prove the inlined body is fully covered. Restore the legacy
+        // whole-function policy rather than leave allunsafe code preemptible.
+        if (Observed.size() != UnsafeCallees.size()) {
+          Fallback("inline-scope", NumInlineScopeFallbacks);
+          return;
+        }
       }
     }
   }
