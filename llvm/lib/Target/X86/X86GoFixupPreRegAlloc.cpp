@@ -573,6 +573,16 @@ class X86GoStatepointFixup {
           FoundNonPointer = true;
         }
       }
+
+      // FoundNonPointer is sticky: once V participates in a non-pointer
+      // access the result can never become true, no matter how many pointer
+      // accesses remain. Stop walking the (potentially very large) use list
+      // and memoize the negative answer. The old code scanned every use even
+      // after this point, which was quadratic on heavily-used Values.
+      if (FoundNonPointer) {
+        PointerAddresses[V] = false;
+        return false;
+      }
     }
     bool Found = FoundPointer && !FoundNonPointer;
     PointerAddresses[V] = Found;
