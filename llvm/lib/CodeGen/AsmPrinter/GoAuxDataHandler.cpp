@@ -220,8 +220,9 @@ MCGoInlTreeNode* MCGoAuxData::addInlNode(DILocation *L, DIScope *Called) {
   FuncInfo.LocToInlNode[L] = Node;
   FuncInfo.InlTree.push_back(Node);
 
-  Node->Line = (int32_t)L->getLine();
-  Node->File = getFileIndex(L->getFile());
+  const DISubprogram *Caller = L->getScope()->getSubprogram();
+  Node->Line = L->getLine() ? L->getLine() : Caller->getLine();
+  Node->File = getFileIndex(L->getLine() ? L->getFile() : Caller->getFile());
 
 
   if (Called != nullptr) {
@@ -1407,6 +1408,7 @@ void MCGoAuxData::computeArgLive(const MachineFunction *MF) {
 void MCGoAuxData::beginFunctionImpl(const MachineFunction *MF) {
   // reset for this function
   resetFunction();
+  FuncInfo.LocToPC.clear();
 
   EntryPC = Asm->OutStreamer->getContext().createTempSymbol();
   Asm->OutStreamer->emitLabel(EntryPC);
@@ -1739,20 +1741,24 @@ void MCGoAuxData::endFunctionImpl(const MachineFunction *MF) {
     symbol += "..pcsp";
     emitPCData(PCSP, symbol);
   }
-  if (FileStarted) {
-    appendPCData(PCFile, LastFileIndex, EndFunc);
-
-    std::string symbol = MF->getName().str();
-    symbol += "..pcfile";
-    emitPCData(PCFile, symbol);
-  }
-  if (LineStarted) {
-    appendPCData(PCLine, LastLineNumber, EndFunc);
-
-    std::string symbol = MF->getName().str();
-    symbol += "..pcline";
-    emitPCData(PCLine, symbol);
-  }
+  // An instruction or pseudo can emit zero bytes. Serialize resolved end
+  // offsets so the Go patcher can discard empty spans before taking deltas.
+  auto EmitSourcePCData = [&](StringRef Suffix, std::vector<PCData> &Table,
+                              int32_t LastValue) {
+    appendPCData(Table, LastValue, EndFunc);
+    MCSymbol *Symbol =
+        Asm->OutContext.getOrCreateSymbol((MF->getName() + Suffix).str());
+    Asm->OutStreamer->emitLabel(Symbol);
+    for (const auto &Entry : Table) {
+      Asm->OutStreamer->emitValue(
+          buildSymbolDiff(Asm->OutContext, Entry.PC, EntryPC), 4);
+      Asm->OutStreamer->emitInt32(Entry.Value);
+    }
+  };
+  if (FileStarted)
+    EmitSourcePCData("..pcfile1", PCFile, LastFileIndex);
+  if (LineStarted)
+    EmitSourcePCData("..pcline1", PCLine, LastLineNumber);
   {
     if (LastStackMapIndex != -1) {
       appendPCData(PCStackMapIndex, LastStackMapIndex, EndFunc);
@@ -1816,11 +1822,7 @@ void MCGoAuxData::endFunctionImpl(const MachineFunction *MF) {
     emitPCData(PCUnsafePoint, symbol);
   }
   if (InlineTreeStarted) {
-    appendPCData(PCInline, LastInlineTree, EndFunc);
-
-    std::string symbol = MF->getName().str();
-    symbol += "..pcinline";
-    emitPCData(PCInline, symbol);
+    EmitSourcePCData("..pcinline1", PCInline, LastInlineTree);
 
     // set parent pc
     for (auto it : FuncInfo.LocToInlNode) {
@@ -1933,19 +1935,6 @@ void MCGoAuxData::endFunctionImpl(const MachineFunction *MF) {
     Asm->OutStreamer->emitGoFuncInfo(FuncInfo);
   }
   {
-    appendPCData(PCIndex, LastPCIndex++, EndFunc);
-    std::string symbol = MF->getName().str();
-    symbol += "..pcindex";
-    emitPCData(PCIndex, symbol);
-  }
-  {
-    std::string symbol = MF->getName().str();
-    symbol += "..dwarflines";
-    MCSymbol *AddrSymbol = Asm->OutContext.getOrCreateSymbol(StringRef(symbol));
-    Asm->OutStreamer->emitLabel(AddrSymbol);
-    Asm->OutStreamer->emitGoDwarfInfo(DwarfTable);
-  }
-  {
     std::string symbol = MF->getName().str();
     symbol += "..endaux";
     MCSymbol *AddrSymbol = Asm->OutContext.getOrCreateSymbol(StringRef(symbol));
@@ -2005,15 +1994,21 @@ void MCGoAuxData::beginInstruction(const MachineInstr *MI) {
     PCArgLive.emplace_back(It->second, getOrCreatePrePCSymbol(MI));
 
   {
-    // TODO: we simply track DebugLoc for every machine instr;
     const DebugLoc &DL = MI->getDebugLoc();
-    int32_t FileIndex = -1;
-    int32_t Line = 0;
+    // A merged instruction may retain its scope with line zero. Attribute
+    // it to that frame's declaration. With no location, use the physical
+    // function's declaration and leave the inline index unset.
+    const DISubprogram *Scope =
+        DL ? DL->getScope()->getSubprogram()
+           : MI->getParent()->getParent()->getFunction().getSubprogram();
+    DIFile *File = DL && DL.getLine() ? DL->getFile()
+                                     : Scope ? Scope->getFile() : nullptr;
+    int32_t FileIndex = File ? getFileIndex(File) : -1;
+    int32_t Line = DL && DL.getLine() ? DL.getLine()
+                                    : Scope ? Scope->getLine() : 0;
     int32_t InlTreeIndex = -1;
     if (DL) {
-      DILocation* L = DL.get();
-      FileIndex = getFileIndex(L->getFile());
-      Line = int32_t(DL.getLine());
+      DILocation *L = DL.get();
       InlTreeIndex = getInlineTreeNodeIndex(L);
 
       // record InlineTreeNode PC
@@ -2103,25 +2098,6 @@ void MCGoAuxData::beginInstruction(const MachineInstr *MI) {
       appendPCData(PCSP, LastSPAdjust, getOrCreatePostPCSymbol(MI));
       LastSPAdjust = PostSP;
     }
-  }
-
-  {
-    auto DwarfLoc = Asm->OutContext.getCurrentDwarfLoc();
-    auto Line = DwarfLoc.getLine();
-    if (Line != 0 && LastFileIndex != -1) {
-      DwarfTable.push_back(
-      MCGoDwarfEntry(
-            LastFileIndex,
-            LastPCIndex,
-            DwarfLoc.getLine(),
-            DwarfLoc.getColumn(),
-            DwarfLoc.getFlags(),
-            DwarfLoc.getDiscriminator()
-          ));
-    }
-
-    appendPCData(PCIndex, LastPCIndex, getOrCreatePrePCSymbol(MI));
-    LastPCIndex++;
   }
 
   {

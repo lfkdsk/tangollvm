@@ -56,7 +56,6 @@ private:
 
   std::vector<PCData> PCUnsafePoint;
   std::vector<PCData> PCStackMapIndex;
-  std::vector<PCData> PCIndex;
 
   StringRef ArgInfo;
   SmallVector<char, 8> ArgLiveInfo;
@@ -65,7 +64,6 @@ private:
 
   std::vector<MCGoFileEntry> FileTable;
   DenseMap<DIFile*, int32_t> FileTableMap;
-  std::vector<MCGoDwarfEntry> DwarfTable;
   bool FuncInfoHasStartLine;
   int32_t GoMinorVersion;
 
@@ -80,7 +78,6 @@ private:
   int32_t LastFileIndex;
   int32_t LastLineNumber;
   int32_t LastInlineTree;
-  int32_t LastPCIndex;
   bool    FileStarted;
   bool    LineStarted;
   bool    InlineTreeStarted;
@@ -140,7 +137,6 @@ private:
     HasStatepoint = false;
     RequireDeferReturnMap = false;
     LastStackMapIndex = -1;
-    LastPCIndex = 0;
     FileStarted = false;
     LineStarted = false;
     InlineTreeStarted = false;
@@ -153,7 +149,6 @@ private:
     PCLine.clear();
     PCInline.clear();
     PCStackMapIndex.clear();
-    PCIndex.clear();
     ArgInfo = {};
     ArgLiveInfo.clear();
     ArgLiveAtInstruction.clear();
@@ -163,7 +158,6 @@ private:
     PCStackMapIndex.clear();
 
     FuncInfo.clear();
-    DwarfTable.clear();
     // FunctionBeginID is the maximum ID seen in previous functions.
     // See GoGCPrinter.cpp
     FunctionBeginID = MaxStatepointID;
