@@ -43,7 +43,7 @@ reject() {
 sdk() {
     mkdir -p "$repo/llvm-bin-release/"{bin,lib,include/llvm-c}
     local name
-    for name in opt llc llvm-link; do
+    for name in opt llc llvm-link llvm-lto tango-thinlto-plan; do
         printf '#!/bin/sh\nexit 0\n' > "$repo/llvm-bin-release/bin/$name"
         chmod +x "$repo/llvm-bin-release/bin/$name"
     done
@@ -78,6 +78,9 @@ cmp "$repo/third-party/go/LICENSE-MIT" "$out/pkg/tangollvm/LICENSE.go-MIT"
  grep -qF "\"lib/libLLVM.so\":\"$(sha "$out/pkg/tangollvm/lib/libLLVM.so")\"" "$out/tangollvm-source.json"
 setup; sdk; rm "$repo/llvm-bin-release/bin/llvm-link"; reject 'incomplete LLVM SDK'
 setup; sdk; chmod -x "$repo/llvm-bin-release/bin/llvm-link"; reject 'not executable'
+setup; sdk; rm "$repo/llvm-bin-release/bin/llvm-lto"; reject 'incomplete LLVM SDK'
+setup; sdk; rm "$repo/llvm-bin-release/bin/tango-thinlto-plan"; reject 'incomplete LLVM SDK'
+setup; sdk; chmod -x "$repo/llvm-bin-release/bin/tango-thinlto-plan"; reject 'not executable'
 setup; reject 'incomplete LLVM SDK'
 for link in /tmp missing ../../../outside; do
     setup; sdk; ln -s "$link" "$repo/llvm-bin-release/lib/extra"; reject 'SDK symlink'

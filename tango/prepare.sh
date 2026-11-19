@@ -92,13 +92,18 @@ for name in "${overlays[@]}"; do
     [[ ! -L "$src" ]] && inside "$src" "$repo/tango/overlay" || fail "unsupported overlay source: $name"
     [[ -f "$src" ]] || fail "missing overlay source: $name"
 done
-sdk_files=(bin/opt bin/llc bin/llvm-link lib/libLLVM.so include/llvm-c/TangoLLVM.h)
+sdk_tools=(opt llc llvm-link llvm-lto tango-thinlto-plan)
+sdk_files=()
+for name in "${sdk_tools[@]}"; do
+    sdk_files+=("bin/$name")
+done
+sdk_files+=(lib/libLLVM.so include/llvm-c/TangoLLVM.h)
 validate_sdk() {
     local sdk=$1 name link target root
     for name in "${sdk_files[@]}"; do
         [[ -f "$sdk/$name" ]] || fail "incomplete LLVM SDK: $sdk/$name; run build.sh first"
     done
-    for name in opt llc llvm-link; do
+    for name in "${sdk_tools[@]}"; do
         [[ -x "$sdk/bin/$name" ]] || fail "LLVM tool is not executable: $name"
     done
     root=$(realpath -e -- "$sdk")

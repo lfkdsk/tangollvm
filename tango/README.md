@@ -51,10 +51,11 @@ tools, libraries, and the LLVM, gollvm and Go license texts. Existing output dir
 not deleted or reused. Use a fresh output directory for each build. This also
 avoids stale objects when runtime layouts or LLVM APIs change.
 
-The SDK must include executable `opt`, `llc` and `llvm-link` tools. Its symlinks
-must be relative, resolve inside the SDK and have existing targets, so the copy
-can be moved independently. Preparation validates both the installed SDK and
-its copy. Source paths cannot escape the Tango checkout or the LLVM overlay.
+The SDK must include executable `opt`, `llc`, `llvm-link`, `llvm-lto` and
+`tango-thinlto-plan` tools. Its symlinks must be relative, resolve inside the SDK
+and have existing targets, so the copy can be moved independently. Preparation
+validates both the installed SDK and its copy. Source paths cannot escape the
+Tango checkout or the LLVM overlay.
 
 `tangollvm-source.json` records both Git revisions, copied Tango input hashes,
 overlay hashes, and selected SDK file hashes. Git revisions alone do not describe uncommitted changes;
