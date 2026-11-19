@@ -44,6 +44,10 @@ using namespace llvm;
 
 static cl::opt<bool> GoGCStats("go-gc-stats", cl::Hidden, cl::init(false));
 
+// StatepointLowering and StackMaps serialize an undef deopt/GC value as this
+// constant so that stack map consumers can recognize it.
+constexpr uint32_t GoUndefLocationMarker = 0xFEFEFEFE;
+
 namespace {
 
 class GoGC : public GCStrategy {
@@ -181,8 +185,34 @@ computeBitVector(const Function * Fn, uint64_t StackSize, bool requireFP,
           CSLocs[i+1].Type == StackMaps::Location::Constant) {
         if (Loc.Type != StackMaps::Location::Direct) {
           // See StackMaps.cpp for Undef Register
-          assert(uint32_t(CSLocs[i+1].Offset) == 0xFEFEFEFE && "invariant");
+          assert((uint32_t(CSLocs[i+1].Offset) == GoUndefLocationMarker) &&
+                 "invariant");
           continue;
+        }
+        // A standalone undef pointer operand is serialized as the undef
+        // marker constant, even when the preceding value lives in a Direct
+        // stack slot. Full LTO can leave an extracted aggregate field undef
+        // on some control flow (e.g. an FCA returned by a PHI), so a run of
+        // markers can follow an ordinary single-pointer slot. Such a run is
+        // not an aggregate pointer bitmap: treating it as local bitmap words
+        // underflows the locals slot index below. Record the head slot as a
+        // single pointer and let the markers fall through as ignored
+        // standalone constants.
+        if (Loc.Type == StackMaps::Location::Direct &&
+            uint32_t(CSLocs[i+1].Offset) == GoUndefLocationMarker) {
+          bool AllUndefMarkers = true;
+          for (unsigned k = i + 1;
+               k < n && CSLocs[k].Type == StackMaps::Location::Constant; ++k)
+            if (uint32_t(CSLocs[k].Offset) != GoUndefLocationMarker) {
+              AllUndefMarkers = false;
+              break;
+            }
+          if (AllUndefMarkers) {
+            if (Idx >= BV->size())
+              BV->resize(Idx + 1);
+            BV->set(Idx);
+            continue;
+          }
         }
         // Make sure it is a local/arg slot, not a spill of in-register value.
         assert(Loc.Type == StackMaps::Location::Direct);
