@@ -3440,7 +3440,10 @@ void X86FrameLowering::adjustForSegmentedStacks(
       return;
     }
 
-    if (StackSize < StackSmall) {
+    // The Go linker requires the patched body to preserve the Go symbol's
+    // split class, even when LTO removes the last call.
+    if (StackSize < StackSmall &&
+        !MF.getFunction().hasFnAttribute("go-preserve-split")) {
       // see obj6.go
       // check whether this function is a leaf function with only call to some
       // runtime functions.
