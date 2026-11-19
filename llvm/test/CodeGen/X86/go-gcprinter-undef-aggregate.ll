@@ -1,7 +1,6 @@
-; RUN: llc -filetype=obj -relocation-model=static \
+; RUN: llc -relocation-model=static \
 ; RUN:   -mtriple=x86_64-unknown-linux-goabi -O3 --cost-kind=latency \
-; RUN:   -tangollvm-lto=true -o %t.o %s
-; RUN: llvm-objdump -s -j .goaux %t.o | FileCheck %s
+; RUN:   -tangollvm-lto=true -o - %s | FileCheck %s
 ; REQUIRES: x86-registered-target
 
 ; Full LTO can leave a field of a first-class aggregate (FCA) value undef on
@@ -53,4 +52,8 @@ attributes #0 = { null_pointer_is_valid }
 ; localspointermaps: 2 maps of 1 bit each; entry map is empty (00) and the
 ; statepoint map keeps the live alloca slot (01). A printer that drops the
 ; Direct slot while skipping the undef markers emits 00 for the second map.
-; CHECK: 00000002 00000001 00000000 01010000
+; CHECK-LABEL: "internal/poll.(*FD).ReadMsgInet4..localspointermaps":
+; CHECK-NEXT: .long 2
+; CHECK-NEXT: .long 1
+; CHECK-NEXT: .byte 0
+; CHECK-NEXT: .byte 1
