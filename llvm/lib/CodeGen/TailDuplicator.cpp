@@ -24,6 +24,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/MachineSSAUpdater.h"
@@ -93,6 +94,16 @@ void TailDuplicator::initMF(MachineFunction &MFin, bool PreRegAlloc,
                             MBFIWrapper *MBFIin,
                             ProfileSummaryInfo *PSIin,
                             bool LayoutModeIn, unsigned TailDupSizeIn) {
+  initMF(MFin, PreRegAlloc, MBPIin, MBFIin, PSIin, LayoutModeIn,
+         TailDupSizeIn, /*MLI=*/nullptr);
+}
+
+void TailDuplicator::initMF(MachineFunction &MFin, bool PreRegAlloc,
+                            const MachineBranchProbabilityInfo *MBPIin,
+                            MBFIWrapper *MBFIin,
+                            ProfileSummaryInfo *PSIin,
+                            bool LayoutModeIn, unsigned TailDupSizeIn,
+                            MachineLoopInfo *MLIin) {
   MF = &MFin;
   TII = MF->getSubtarget().getInstrInfo();
   TRI = MF->getSubtarget().getRegisterInfo();
@@ -100,6 +111,7 @@ void TailDuplicator::initMF(MachineFunction &MFin, bool PreRegAlloc,
   MBPI = MBPIin;
   MBFI = MBFIin;
   PSI = PSIin;
+  MLI = MLIin;
   TailDupSize = TailDupSizeIn;
 
   assert(MBPI != nullptr && "Machine Branch Probability Info required");
@@ -561,6 +573,43 @@ void TailDuplicator::updateSuccessorsPHIs(
   }
 }
 
+/// Tango LS1c: decide whether a Go-CC block that carries an atomic RMW has
+/// the harmful lockSlow shape that must not be tail-duplicated.
+///
+/// The broad LS1 rule refused to duplicate *any* Go atomic-RMW block, which
+/// also suppressed beneficial duplication of ordinary atomic fast paths. The
+/// measured regression (sync.(*Mutex).lockSlow) is a much narrower shape: a
+/// cmpxchg block inside a spin loop that several control-flow paths merge
+/// into, whose dominant edge funnels failed comparisons back through the
+/// loop latch. Duplicating that block creates a second "lock cmpxchg" and an
+/// extra hard-to-predict branch on the retry path, raising memory-ordering
+/// machine clears and cross-core HITM traffic.
+///
+/// Match only that shape:
+///   * block placement (MachineLoopInfo available) -- the harmful duplicate
+///     is introduced by MachineBlockPlacement, not the pre-regalloc pass;
+///   * the block is inside a machine loop;
+///   * it has at least three predecessors (the multi-way trellis);
+///   * one of its successors stays in the same loop and is taken with a
+///     strongly dominant probability (the failure/latch edge, ~97% here).
+/// Everything else keeps the generic tail-duplication heuristic.
+static bool isHarmfulGoAtomicLoopRMW(
+    MachineBasicBlock &TailBB, MachineLoopInfo *MLI,
+    const MachineBranchProbabilityInfo *MBPI) {
+  if (!MLI)
+    return false;
+  const MachineLoop *L = MLI->getLoopFor(&TailBB);
+  if (!L || TailBB.pred_size() < 3)
+    return false;
+  static const BranchProbability DominantEdge(90, 100); // >= 90%
+  for (MachineBasicBlock *Succ : TailBB.successors()) {
+    if (L->contains(Succ) &&
+        MBPI->getEdgeProbability(&TailBB, Succ) >= DominantEdge)
+      return true;
+  }
+  return false;
+}
+
 /// Determine if it is profitable to duplicate this block.
 bool TailDuplicator::shouldTailDuplicate(bool IsSimple,
                                          MachineBasicBlock &TailBB) {
@@ -648,6 +697,27 @@ bool TailDuplicator::shouldTailDuplicate(bool IsSimple,
     // spills.
     if (PreRegAlloc && MI.isCall())
       return false;
+
+    // Tango LS1c: suppress tail duplication only for the harmful lockSlow
+    // shape (a multi-predecessor atomic-RMW block inside a loop with a
+    // dominant in-loop failure edge), not for every Go atomic-RMW block.
+    // Ordinary atomic fast paths still benefit from duplication. Plain
+    // volatile loads (e.g. Go nil checks) and non-RMW atomics never reach
+    // this check. Scoped to the Go calling conventions so the generic
+    // heuristic is unchanged.
+    CallingConv::ID CC = MF->getFunction().getCallingConv();
+    if ((CC == CallingConv::Go_0 || CC == CallingConv::Go_Internal) &&
+        MI.mayLoad() && MI.mayStore() &&
+        llvm::any_of(MI.memoperands(),
+                     [](const MachineMemOperand *MMO) {
+                       return MMO->isAtomic();
+                     }) &&
+        isHarmfulGoAtomicLoopRMW(TailBB, MLI, MBPI)) {
+      LLVM_DEBUG(dbgs() << "[ls1c-skip-taildup] fn=" << MF->getName()
+                        << " bb=" << TailBB.getNumber()
+                        << " preds=" << TailBB.pred_size() << "\n");
+      return false;
+    }
 
     // TailDuplicator::appendCopies will erroneously place COPYs after
     // INLINEASM_BR instructions after 4b0aa5724fea, which demonstrates the same

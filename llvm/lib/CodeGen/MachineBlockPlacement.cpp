@@ -3479,7 +3479,8 @@ bool MachineBlockPlacement::runOnMachineFunction(MachineFunction &MF) {
       TailDupSize = 1;
     bool PreRegAlloc = false;
     TailDup.initMF(MF, PreRegAlloc, MBPI, MBFI.get(), PSI,
-                   /* LayoutMode */ true, TailDupSize);
+                   /* LayoutMode */ true, TailDupSize,
+                   /* MLI */ MLI);
     precomputeTriangleChains();
   }
 

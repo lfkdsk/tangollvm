@@ -30,6 +30,7 @@ class MachineBasicBlock;
 class MachineBranchProbabilityInfo;
 class MachineFunction;
 class MachineInstr;
+class MachineLoopInfo;
 class MachineModuleInfo;
 class MachineRegisterInfo;
 class ProfileSummaryInfo;
@@ -44,6 +45,7 @@ class TailDuplicator {
   MachineFunction *MF;
   MBFIWrapper *MBFI;
   ProfileSummaryInfo *PSI;
+  MachineLoopInfo *MLI;
   bool PreRegAlloc;
   bool LayoutMode;
   unsigned TailDupSize;
@@ -72,6 +74,15 @@ public:
               MBFIWrapper *MBFI,
               ProfileSummaryInfo *PSI,
               bool LayoutMode, unsigned TailDupSize = 0);
+
+  /// As above, with optional MachineLoopInfo used by the Go atomic-RMW
+  /// tail-duplication guard (only available during block placement).
+  void initMF(MachineFunction &MF, bool PreRegAlloc,
+              const MachineBranchProbabilityInfo *MBPI,
+              MBFIWrapper *MBFI,
+              ProfileSummaryInfo *PSI,
+              bool LayoutMode, unsigned TailDupSize,
+              MachineLoopInfo *MLI);
 
   bool tailDuplicateBlocks();
   static bool isSimpleBB(MachineBasicBlock *TailBB);
