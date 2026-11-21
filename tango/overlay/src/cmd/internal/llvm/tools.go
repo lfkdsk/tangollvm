@@ -97,6 +97,29 @@ func (t *Tools) RunShell(exe string, args ...string) error {
 	return cmd.Run()
 }
 
+// DefaultGoLoopAlignArgs returns the driver-default llc knobs for the
+// INT-19 c-loop64 policy (ALIGN1): innermost hot natural loop headers of
+// AMD64 gc "go" functions are aligned to 64 B. In no-profile builds every
+// innermost loop header is aligned; with a profile summary the PGO-hot
+// filter still applies.
+//
+// The default is overridable: any explicit -go-align-* or
+// -go-loop-align-bytes token in GOLLVMLLCCL replaces the driver
+// default, and
+// GOLLVM_DEFAULT_LOOP_ALIGN=0 disables it altogether. The returned arguments
+// are separate argv elements, safe for both direct exec and generated
+// shell scripts.
+func DefaultGoLoopAlignArgs() []string {
+	user := os.Getenv("GOLLVMLLCCL")
+	if os.Getenv("GOLLVM_DEFAULT_LOOP_ALIGN") == "0" ||
+		strings.Contains(user, "go-align-pgo-hot-loops") ||
+		strings.Contains(user, "go-align-go-functions") ||
+		strings.Contains(user, "go-loop-align-bytes") {
+		return nil
+	}
+	return []string{"-go-align-pgo-hot-loops", "-go-loop-align-bytes=64"}
+}
+
 func (t *Tools) CompileModule(input string, triple string, features string, eraseDupOk func(string), optArgs []string, args []string) (string, error) {
 	output := input + ".o"
 	opt := input[:len(input)-3] + ".opt.bc"
@@ -237,6 +260,9 @@ func (t *Tools) runLTO(archives []string) (string, error) {
 		"--cost-kind=" + costKind,
 		"-tangollvm-lto=true",
 	}
+	// INT-19 (ALIGN1 c-loop64): full-LTO backend default 64 B hot-loop
+	// alignment unless GOLLVMLLCCL overrides it or GOLLVM_DEFAULT_LOOP_ALIGN=0.
+	llcParams = append(llcParams, DefaultGoLoopAlignArgs()...)
 
 	stages := []struct {
 		tool string

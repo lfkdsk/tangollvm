@@ -5570,6 +5570,13 @@ bool SROA::deleteDeadInstructions(
 /// the PromotableAllocas list. If that list is empty, there is nothing to do.
 /// This function returns whether any promotion occurred.
 bool SROA::promoteAllocas(Function &F) {
+  // Secondary resplit enqueues (ResplitPromotableAllocas) can land a Go
+  // stack-object alloca here even though the entry-block guard skipped it.
+  // Remove such allocas instead of promoting them.
+  llvm::erase_if(PromotableAllocas, [](AllocaInst *AI) {
+    return TangoLLVM::hasGoGC(*AI->getFunction()) &&
+           AI->hasMetadata("go.stackobject.gcdata");
+  });
   if (PromotableAllocas.empty())
     return false;
 
@@ -5609,6 +5616,18 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
       if (TangoLLVM::hasGoGC(F) && dontSROA(AI))
         continue;
 
+      // A Go stack object carries the frontend-computed frame layout in
+      // "go.stackobject.gcdata". The runtime stack copier resolves interior
+      // stack pointers through this exact record, so the alloca must survive
+      // optimization as a single frame slot. SROA promotion/splitting would
+      // either delete the alloca (mem2reg) or replace it with partitions,
+      // dropping the metadata and emitting a synthetic record at a different
+      // frame offset. Keep these allocas intact, matching the per-package
+      // (non-LTO) compilation path where they are never promoted.
+      if (TangoLLVM::hasGoGC(F) &&
+          AI->hasMetadata("go.stackobject.gcdata"))
+        continue;
+
       if (DL.getTypeAllocSize(AI->getAllocatedType()).isScalable() &&
           isAllocaPromotable(AI))
         PromotableAllocas.push_back(AI);
@@ -5625,8 +5644,16 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
 
   do {
     while (!Worklist.empty()) {
+      AllocaInst *WorkAI = Worklist.pop_back_val();
+      // Splitting a neighboring alloca can re-enqueue a Go stack-object
+      // alloca through the secondary Worklist inserts below, bypassing the
+      // entry-block guard. Re-check here so a metadata-bearing alloca is
+      // never split or promoted once it is inside SROA.
+      if (TangoLLVM::hasGoGC(F) &&
+          WorkAI->hasMetadata("go.stackobject.gcdata"))
+        continue;
       auto [IterationChanged, IterationCFGChanged] =
-          runOnAlloca(*Worklist.pop_back_val());
+          runOnAlloca(*WorkAI);
       Changed |= IterationChanged;
       CFGChanged |= IterationCFGChanged;
 

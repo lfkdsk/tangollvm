@@ -16,6 +16,7 @@
 #include "GoAuxDataHandler.h"
 #include "GoGCProgWriter.h"
 #include "llvm/ADT/BreadthFirstIterator.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -54,6 +55,8 @@ STATISTIC(NumInlineScopeFallbacks,
           "Functions made all-unsafe after an unobservable inlined unsafe scope");
 STATISTIC(NumPrunedInlineScopes,
           "Inlined unsafe-scope records pruned because the body folded before codegen");
+STATISTIC(NumReconstructedInlineScopes,
+          "Inlined unsafe-scope observations reconstructed from IR frame locations");
 
 static cl::opt<bool> TangoLLVMLTO("tangollvm-lto", cl::Hidden, cl::init(false));
 
@@ -72,6 +75,43 @@ static cl::opt<bool> StrictUnsafePoint("go-strict-unsafe-point",
 static cl::opt<bool>
     DebugUnsafeFallback("go-debug-unsafe-fallback", cl::Hidden,
                         cl::init(false));
+// UP4: kill switch for IR-anchored reconstruction of inlined unsafe scopes
+// whose machine instructions lost their debug location after IR emission
+// (isel memory-operand folding keeps only the root instruction's caller
+// frame; machine sinking rewrites the location to a line-0 caller frame).
+// Enabled by default; setting it restores the UPF2/UP3 whole-function
+// fallback for those shapes.
+static cl::opt<bool>
+    NoInlineScopeReconstruct("go-no-inline-scope-reconstruct", cl::Hidden,
+                             cl::init(false));
+
+// PCV2: attribution of instructions without a source line (no DebugLoc, or a
+// line-0 DebugLoc left by location merging or hoisting) in the Go file, line
+// and inline index tables. The DW1 declaration fallback ("decl") sends each
+// such instruction to its frame's declaration line, and an instruction without
+// a DebugLoc to the outermost frame. Scheduling interleaves these instructions
+// with located code, so all three tables fill with short X -> declaration -> X
+// round trips that grow .gopclntab and the number of entries the runtime
+// decodes per lookup. See computeSourceFill.
+namespace {
+enum class GoSourceFillKind { Decl, Neighbor, Block, Frame, Prev };
+} // namespace
+static cl::opt<GoSourceFillKind> GoSourceFill(
+    "go-source-fill", cl::Hidden, cl::init(GoSourceFillKind::Neighbor),
+    cl::desc("Go PC table position of instructions without a source line"),
+    cl::values(
+        clEnumValN(GoSourceFillKind::Decl, "decl",
+                   "Use the declaration of the instruction's own frame"),
+        clEnumValN(GoSourceFillKind::Neighbor, "neighbor",
+                   "Take a neighboring located position in the same inline "
+                   "frame, or the frame that surrounds an unlocated run"),
+        clEnumValN(GoSourceFillKind::Block, "block",
+                   "Like neighbor, but an unlocated run joins the surrounding "
+                   "frame only inside one basic block"),
+        clEnumValN(GoSourceFillKind::Frame, "frame",
+                   "Like neighbor, but never change an instruction's frame"),
+        clEnumValN(GoSourceFillKind::Prev, "prev",
+                   "Take the previous instruction's position")));
 
 // Any negative value would be OK because no index should be negative.
 const int32_t DeferReturnStackMapIndexPlaceholder = -1000;
@@ -1031,15 +1071,50 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       // the whole-function policy.
       SmallDenseSet<StringRef, 8> IRScopes;
       bool HasAnyDebugLoc = false;
+      // UP4: IR-anchored reconstruction tables. Backend isel memory-operand
+      // folding (a compare/multiply fused with an inlined load) keeps only
+      // the root instruction's caller-frame DebugLoc, and machine sinking
+      // rewrites sunk instructions to a line-0 caller frame. The inlined
+      // unsafe scope therefore disappears from machine locations although its
+      // IR body is alive. For every IR location whose inline chain contains a
+      // recorded callee, index the active callee names by:
+      //   ExactFrames - every chain frame's (subprogram, source line), so a
+      //                 machine location retaining that caller frame can be
+      //                 attributed precisely;
+      //   SPFrames    - the frame subprogram alone, for line-0 and location-
+      //                 less instructions, where only conservative subprogram
+      //                 granularity is available.
+      SmallDenseMap<std::pair<const DISubprogram *, unsigned>,
+                    SmallDenseSet<StringRef, 4>, 16>
+          ExactFrames;
+      SmallDenseMap<const DISubprogram *, SmallDenseSet<StringRef, 4>, 8>
+          SPFrames;
       for (const BasicBlock &BB : MF->getFunction())
         for (const Instruction &I : BB) {
-          if (!HasAnyDebugLoc && I.getDebugLoc())
-            HasAnyDebugLoc = true;
-          for (const DILocation *L = I.getDebugLoc(); L;
-               L = L->getInlinedAt()) {
+          const DILocation *Leaf = I.getDebugLoc();
+          if (!Leaf)
+            continue;
+          HasAnyDebugLoc = true;
+          SmallDenseSet<StringRef, 4> Active;
+          SmallVector<const DISubprogram *, 4> ChainSPs;
+          for (const DILocation *L = Leaf; L; L = L->getInlinedAt()) {
             const DISubprogram *SP = findSubprogramFromScope(L->getScope());
-            if (SP)
-              IRScopes.insert(SP->getName());
+            if (!SP)
+              continue;
+            IRScopes.insert(SP->getName());
+            ChainSPs.push_back(SP);
+            if (UnsafeCallees.contains(SP->getName()))
+              Active.insert(SP->getName());
+          }
+          if (Active.empty())
+            continue;
+          for (const DISubprogram *SP : ChainSPs)
+            SPFrames[SP].insert(Active.begin(), Active.end());
+          for (const DILocation *L = Leaf; L; L = L->getInlinedAt()) {
+            if (const DISubprogram *SP =
+                    findSubprogramFromScope(L->getScope()))
+              ExactFrames[{SP, L->getLine()}].insert(Active.begin(),
+                                                      Active.end());
           }
         }
       if (HasAnyDebugLoc) {
@@ -1057,28 +1132,90 @@ void MCGoAuxData::computeFunctionUnsafePoint(const MachineFunction *MF) {
       }
 
       if (!UnsafeCallees.empty()) {
-        SmallDenseSet<StringRef, 8> Observed;
+        // Pass 1 (UPF2): direct observation of the inlined scope from a
+        // machine inlined-at location. Every directly observed callee is
+        // fully covered by its own machine instructions; reconstruction must
+        // not broaden those functions, so it only runs for callees missing
+        // from this pass.
+        SmallDenseSet<StringRef, 8> DirectObserved;
         for (const MachineBasicBlock &MBB : *MF) {
           for (const MachineInstr &MI : MBB) {
             if (MI.isMetaInstruction())
               continue;
             for (const DILocation *L = MI.getDebugLoc(); L;
                  L = L->getInlinedAt()) {
-              const DISubprogram *SP = findSubprogramFromScope(L->getScope());
+              const DISubprogram *SP =
+                  findSubprogramFromScope(L->getScope());
               if (SP && UnsafeCallees.contains(SP->getName())) {
                 UnsafePoints.insert(&MI);
-                Observed.insert(SP->getName());
+                DirectObserved.insert(SP->getName());
                 break;
               }
             }
           }
         }
 
+        // Pass 2 (UP4): reconstruct only callees whose IR body is alive but
+        // whose scope vanished from machine locations (isel memory-operand
+        // folding, machine sinking). Attributing only the missing names keeps
+        // directly covered functions byte-identical to UPF2. Disabled for
+        // stripped debug info, where the conservative fallback below stays.
+        if (!NoInlineScopeReconstruct && HasAnyDebugLoc &&
+            DirectObserved.size() != UnsafeCallees.size()) {
+          SmallDenseSet<StringRef, 8> Missing;
+          for (StringRef Name : UnsafeCallees)
+            if (!DirectObserved.contains(Name))
+              Missing.insert(Name);
+          auto MarkMissing = [&](const MachineInstr &MI,
+                                 const SmallDenseSet<StringRef, 4> &Names) {
+            for (StringRef Name : Names)
+              if (Missing.contains(Name))
+                UnsafePoints.insert(&MI);
+          };
+          for (const MachineBasicBlock &MBB : *MF) {
+            for (const MachineInstr &MI : MBB) {
+              if (MI.isMetaInstruction())
+                continue;
+              const DebugLoc &DL = MI.getDebugLoc();
+              if (!DL) {
+                // No location: attribute at the physical function's
+                // subprogram granularity only.
+                const DISubprogram *FnSP =
+                    MF->getFunction().getSubprogram();
+                auto It = FnSP ? SPFrames.find(FnSP) : SPFrames.end();
+                if (It != SPFrames.end())
+                  MarkMissing(MI, It->second);
+                continue;
+              }
+              for (const DILocation *L = DL; L; L = L->getInlinedAt()) {
+                const DISubprogram *SP =
+                    findSubprogramFromScope(L->getScope());
+                if (!SP)
+                  continue;
+                if (L->getLine() == 0) {
+                  // Line-0 frame (e.g. a post-sinking merged location):
+                  // subprogram granularity, the source line is gone.
+                  auto It = SPFrames.find(SP);
+                  if (It != SPFrames.end())
+                    MarkMissing(MI, It->second);
+                } else if (auto It =
+                               ExactFrames.find({SP, L->getLine()});
+                           It != ExactFrames.end()) {
+                  MarkMissing(MI, It->second);
+                }
+              }
+            }
+          }
+          for (StringRef Name : Missing)
+            if (DirectObserved.insert(Name).second)
+              ++NumReconstructedInlineScopes;
+        }
+
         // Conservative fallback: if a surviving recorded callee has no
         // observable machine scope (debug info stripped), scoped marking
         // cannot prove the inlined body is fully covered. Restore the legacy
         // whole-function policy rather than leave allunsafe code preemptible.
-        if (Observed.size() != UnsafeCallees.size()) {
+        if (DirectObserved.size() != UnsafeCallees.size()) {
           Fallback("inline-scope", NumInlineScopeFallbacks);
           return;
         }
@@ -1418,6 +1555,7 @@ void MCGoAuxData::beginFunctionImpl(const MachineFunction *MF) {
   computeFuncInfo(MF);
   computeFunctionUnsafePoint(MF);
   computeArgLive(MF);
+  computeSourceFill(MF);
 
   {
     // Every Go function has a PC TText
@@ -1984,6 +2122,105 @@ void MCGoAuxData::appendPCData(std::vector<PCData> &list, int32_t value, MCSymbo
   list.push_back(PCData(value, PC));
 }
 
+// The declaration fallback (DW1). A merged instruction may retain its scope
+// with line zero: attribute it to that frame's declaration. With no location,
+// use the physical function's declaration and leave the inline index unset.
+MCGoAuxData::SourcePos MCGoAuxData::getOwnSourcePos(const MachineInstr *MI) {
+  const DebugLoc &DL = MI->getDebugLoc();
+  const DISubprogram *Scope =
+      DL ? DL->getScope()->getSubprogram()
+         : MI->getParent()->getParent()->getFunction().getSubprogram();
+  SourcePos Pos;
+  Pos.File = DL && DL.getLine() ? DL->getFile()
+                                : Scope ? Scope->getFile() : nullptr;
+  Pos.Line = DL && DL.getLine() ? DL.getLine() : Scope ? Scope->getLine() : 0;
+  Pos.InlTree = DL ? getInlineTreeNodeIndex(DL.get()) : -1;
+  return Pos;
+}
+
+// PCV2: choose Go table positions for instructions without a source line.
+//
+// Pinned instructions keep their own position: instructions with a source
+// line; calls, because the runtime resolves a return address minus one to the
+// call, so tracebacks, runtime.Caller and stack maps see unchanged values; and
+// every instruction whose location is an inline tree node's parent PC
+// location, because the runtime reads the parent frame's line and inline
+// index at that PC. Unpinned instructions before the first pinned one keep
+// the declaration, so the function entry still reports the declaration line.
+//
+// "prev" gives each later unpinned instruction the previous instruction's
+// position. "neighbor" handles each run of unpinned instructions between
+// pinned instructions L and R. An instruction with a line-0 DebugLoc keeps its
+// own inline frame and takes the position of L, else R, when that one is in
+// the same frame. An instruction without a DebugLoc has no frame of its own;
+// when L and R share a frame it takes L's position, as DWARF lexical scope
+// ranges include such instructions in the scope around them. Otherwise it is
+// treated like a line-0 instruction of the outermost frame. Instructions that
+// match neither rule keep the declaration.
+void MCGoAuxData::computeSourceFill(const MachineFunction *MF) {
+  SourceFill.clear();
+  if (GoSourceFill == GoSourceFillKind::Decl)
+    return;
+
+  DenseSet<const DILocation *> ParentPCLocs;
+  for (const auto &It : FuncInfo.LocToInlNode)
+    if (const DILocation *RL = FuncInfo.findRealLocation(It.first))
+      ParentPCLocs.insert(RL);
+  auto IsPinned = [&](const MachineInstr &MI) {
+    const DebugLoc &DL = MI.getDebugLoc();
+    return (DL && DL.getLine()) || MI.isCall() ||
+           (DL && ParentPCLocs.contains(DL.get()));
+  };
+
+  // Instructions in the order AsmPrinter emits them.
+  SmallVector<const MachineInstr *, 0> Insts;
+  for (const auto &MBB : *MF)
+    for (const auto &MI : MBB)
+      if (!MI.isMetaInstruction())
+        Insts.push_back(&MI);
+
+  if (GoSourceFill == GoSourceFillKind::Prev) {
+    std::optional<SourcePos> Prev;
+    for (const MachineInstr *MI : Insts) {
+      if (Prev && !IsPinned(*MI)) {
+        SourceFill[MI] = *Prev;
+        continue;
+      }
+      Prev = getOwnSourcePos(MI);
+    }
+    return;
+  }
+
+  std::optional<SourcePos> Left;
+  size_t RunBegin = 0;
+  for (size_t I = 0, E = Insts.size(); I <= E; ++I) {
+    if (I < E && !IsPinned(*Insts[I]))
+      continue;
+    std::optional<SourcePos> Right;
+    if (I < E)
+      Right = getOwnSourcePos(Insts[I]);
+    if (Left) {
+      bool Surrounded = Right && Left->InlTree == Right->InlTree;
+      if (GoSourceFill == GoSourceFillKind::Frame)
+        Surrounded = false;
+      else if (GoSourceFill == GoSourceFillKind::Block && Surrounded)
+        Surrounded = Insts[RunBegin - 1]->getParent() == Insts[I]->getParent();
+      for (size_t J = RunBegin; J < I; ++J) {
+        const MachineInstr *MI = Insts[J];
+        SourcePos Own = getOwnSourcePos(MI);
+        if (!MI->getDebugLoc() && Surrounded)
+          SourceFill[MI] = *Left;
+        else if (Left->InlTree == Own.InlTree)
+          SourceFill[MI] = *Left;
+        else if (Right && Right->InlTree == Own.InlTree)
+          SourceFill[MI] = *Right;
+      }
+    }
+    Left = Right;
+    RunBegin = I + 1;
+  }
+}
+
 void MCGoAuxData::beginInstruction(const MachineInstr *MI) {
   if (MI->isMetaInstruction()) {
     return;
@@ -1995,21 +2232,14 @@ void MCGoAuxData::beginInstruction(const MachineInstr *MI) {
 
   {
     const DebugLoc &DL = MI->getDebugLoc();
-    // A merged instruction may retain its scope with line zero. Attribute
-    // it to that frame's declaration. With no location, use the physical
-    // function's declaration and leave the inline index unset.
-    const DISubprogram *Scope =
-        DL ? DL->getScope()->getSubprogram()
-           : MI->getParent()->getParent()->getFunction().getSubprogram();
-    DIFile *File = DL && DL.getLine() ? DL->getFile()
-                                     : Scope ? Scope->getFile() : nullptr;
-    int32_t FileIndex = File ? getFileIndex(File) : -1;
-    int32_t Line = DL && DL.getLine() ? DL.getLine()
-                                    : Scope ? Scope->getLine() : 0;
-    int32_t InlTreeIndex = -1;
+    const auto Fill = SourceFill.find(MI);
+    const SourcePos Pos =
+        Fill != SourceFill.end() ? Fill->second : getOwnSourcePos(MI);
+    int32_t FileIndex = Pos.File ? getFileIndex(Pos.File) : -1;
+    int32_t Line = Pos.Line;
+    int32_t InlTreeIndex = Pos.InlTree;
     if (DL) {
       DILocation *L = DL.get();
-      InlTreeIndex = getInlineTreeNodeIndex(L);
 
       // record InlineTreeNode PC
       if (FuncInfo.LocToInstr.find(L) != FuncInfo.LocToInstr.end()) {

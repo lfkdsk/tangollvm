@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <utility>
 
+extern cl::opt<bool> ShowMmapEvents;
+
 cl::opt<std::string> OutputFilename("output", cl::value_desc("output"),
                                     cl::Required,
                                     cl::desc("Output profile file"));
@@ -168,7 +170,8 @@ void ProfileGeneratorBase::write(std::unique_ptr<SampleProfileWriter> Writer,
 }
 
 void ProfileGeneratorBase::write() {
-  if (ProfileMap.empty())
+  // A trace used to inspect binary mappings may have no samples.
+  if (ProfileMap.empty() && !ShowMmapEvents)
     exitWithError("Generated an empty profile; check the input samples, binary, "
                   "and profile filters.");
 

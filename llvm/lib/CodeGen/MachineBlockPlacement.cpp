@@ -61,6 +61,7 @@
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
@@ -98,6 +99,25 @@ static cl::opt<unsigned> AlignAllNonFallThruBlocks(
              "predecessors (i.e. don't add nops that are executed). In log2 "
              "format (e.g 4 means align on 16B boundaries)."),
     cl::init(0), cl::Hidden);
+
+static cl::opt<bool> AlignGoPGOHotLoops(
+    "go-align-pgo-hot-loops", cl::Hidden, cl::init(false),
+    cl::desc("Prefer wider alignment for hot innermost loop headers in "
+             "AMD64 Go functions. With a profile summary only PGO-hot "
+             "loops qualify; without one every innermost natural loop "
+             "header qualifies. The boundary is set by "
+             "-go-loop-align-bytes."));
+
+static cl::opt<unsigned> GoLoopAlignBytes(
+    "go-loop-align-bytes", cl::Hidden, cl::init(32),
+    cl::desc("Byte boundary used by -go-align-pgo-hot-loops and "
+             "-go-align-go-functions (16, 32 or 64)"));
+
+static cl::opt<bool> AlignGoFunctions(
+    "go-align-go-functions", cl::Hidden, cl::init(false),
+    cl::desc("Force the -go-loop-align-bytes entry alignment for every "
+             "AMD64 gc \"go\" function, so LLVM computes block padding "
+             "relative to the boundary the Go linker places the symbol on"));
 
 static cl::opt<unsigned> MaxBytesForAlignmentOverride(
     "max-bytes-for-alignment",
@@ -2941,6 +2961,30 @@ void MachineBlockPlacement::alignBlocks() {
   if (FunctionChain.begin() == FunctionChain.end())
     return; // Empty chain.
 
+  const Function &Fn = F->getFunction();
+  const bool IsGoAMD64 =
+      F->getTarget().getTargetTriple().getArch() == Triple::x86_64 &&
+      Fn.hasGC() && Fn.getGC() == "go";
+  if (!isPowerOf2_32(GoLoopAlignBytes) || GoLoopAlignBytes > 64 ||
+      GoLoopAlignBytes < 16)
+    report_fatal_error(
+        "-go-loop-align-bytes must be a power of two between 16 and 64");
+  const Align GoLoopAlign(GoLoopAlignBytes);
+
+  // The Go linker re-gaps individual functions, but LLVM still picks the
+  // intra-function padding relative to the entry alignment it declares.
+  if (AlignGoFunctions && IsGoAMD64)
+    F->ensureAlignment(GoLoopAlign);
+
+  // With a profile summary keep the LAY1 PGO-hot filter. Gate builds pass
+  // -pgo=off (no summary): in that mode the enabled option covers every
+  // innermost natural loop header, matching the structural "hot loop"
+  // census used to evaluate the alignment arms.
+  const bool HasProfileSummary = PSI && PSI->hasProfileSummary();
+  const bool AlignHotLoops =
+      AlignGoPGOHotLoops && IsGoAMD64 &&
+      (!HasProfileSummary || PSI->isFunctionEntryHot(&Fn));
+
   const BranchProbability ColdProb(1, 5); // 20%
   BlockFrequency EntryFreq = MBFI->getBlockFreq(&F->front());
   BlockFrequency WeightedEntryFreq = EntryFreq * ColdProb;
@@ -2978,7 +3022,13 @@ void MachineBlockPlacement::alignBlocks() {
     }
 
     // Use max of the TLIAlign and MDAlign
-    const Align LoopAlign = std::max(TLIAlign, Align(MDAlign));
+    Align LoopAlign = std::max(TLIAlign, Align(MDAlign));
+    const bool AlignHotHeader =
+        AlignHotLoops && ChainBB == L->getHeader() &&
+        (HasProfileSummary ? PSI->isHotBlock(ChainBB, MBFI.get())
+                           : L->isInnermost());
+    if (AlignHotHeader)
+      LoopAlign = std::max(LoopAlign, GoLoopAlign);
     if (LoopAlign == 1)
       continue; // Don't care about loop alignment.
 
@@ -3005,7 +3055,12 @@ void MachineBlockPlacement::alignBlocks() {
     MachineBasicBlock *LayoutPred =
         &*std::prev(MachineFunction::iterator(ChainBB));
 
-    auto DetermineMaxAlignmentPadding = [&]() {
+    auto AlignBlock = [&]() {
+      ChainBB->setAlignment(LoopAlign);
+      // Go relinks individual functions. Preserve the alignment of this loop
+      // relative to its function entry when the linker moves the function.
+      if (AlignHotHeader)
+        F->ensureAlignment(GoLoopAlign);
       // Set the maximum bytes allowed to be emitted for alignment.
       unsigned MaxBytes;
       if (MaxBytesForAlignmentOverride.getNumOccurrences() > 0)
@@ -3018,8 +3073,7 @@ void MachineBlockPlacement::alignBlocks() {
     // Force alignment if all the predecessors are jumps. We already checked
     // that the block isn't cold above.
     if (!LayoutPred->isSuccessor(ChainBB)) {
-      ChainBB->setAlignment(LoopAlign);
-      DetermineMaxAlignmentPadding();
+      AlignBlock();
       continue;
     }
 
@@ -3030,10 +3084,8 @@ void MachineBlockPlacement::alignBlocks() {
     BranchProbability LayoutProb =
         MBPI->getEdgeProbability(LayoutPred, ChainBB);
     BlockFrequency LayoutEdgeFreq = MBFI->getBlockFreq(LayoutPred) * LayoutProb;
-    if (LayoutEdgeFreq <= (Freq * ColdProb)) {
-      ChainBB->setAlignment(LoopAlign);
-      DetermineMaxAlignmentPadding();
-    }
+    if (LayoutEdgeFreq <= (Freq * ColdProb))
+      AlignBlock();
   }
 }
 

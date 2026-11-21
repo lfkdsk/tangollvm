@@ -82,6 +82,17 @@ private:
   bool    LineStarted;
   bool    InlineTreeStarted;
 
+  // Source position of an instruction for the Go file, line and inline index
+  // tables, before the file is mapped to its Go file index.
+  struct SourcePos {
+    DIFile *File = nullptr;
+    int32_t Line = 0;
+    int32_t InlTree = -1;
+  };
+  // Positions chosen by computeSourceFill for instructions without a source
+  // line. Other instructions use getOwnSourcePos.
+  DenseMap<const MachineInstr *, SourcePos> SourceFill;
+
   int32_t LastStackMapIndex;
   bool    HasStatepoint;
   bool    RequireDeferReturnMap;
@@ -164,6 +175,7 @@ private:
 
     UnsafePoints.clear();
     AllUnsafe = true;
+    SourceFill.clear();
   }
 
   static unsigned ptrDataSize(const DataLayout&, Type*);
@@ -176,6 +188,8 @@ private:
   void computeFunctionSP(const MachineFunction *MF);
   void computeFuncInfo(const MachineFunction *MF);
   void computeFunctionUnsafePoint(const MachineFunction *MF);
+  void computeSourceFill(const MachineFunction *MF);
+  SourcePos getOwnSourcePos(const MachineInstr *MI);
   MCGoInlTreeNode* addInlNode(DILocation* M, DIScope *Called);
 
   int32_t getFileIndex(DIFile* F);

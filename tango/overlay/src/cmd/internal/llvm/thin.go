@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"internal/buildcfg"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +31,7 @@ type thinModule struct {
 	Functions int
 }
 
-func thinSummary(path, work string, occurrences map[string]int) (string, error) {
+func thinSummary(path, dst string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -44,23 +45,19 @@ func thinSummary(path, work string, occurrences map[string]int) (string, error) 
 		if entry.Name != archive.ThinLTOEntry {
 			continue
 		}
-		tmp, err := os.CreateTemp(work, ".summary-")
+		out, err := os.Create(dst)
 		if err != nil {
 			return "", err
 		}
-		defer os.Remove(tmp.Name())
 		h := sha256.New()
-		size, err := io.Copy(io.MultiWriter(tmp, h), io.NewSectionReader(f, entry.Offset, entry.Size))
-		if err := errors.Join(err, tmp.Close()); err != nil {
+		size, err := io.Copy(io.MultiWriter(out, h), io.NewSectionReader(f, entry.Offset, entry.Size))
+		if err := errors.Join(err, out.Close()); err != nil {
 			return "", err
 		}
 		if size != entry.Size {
 			return "", io.ErrUnexpectedEOF
 		}
-		digest := fmt.Sprintf("%x", h.Sum(nil))
-		name := fmt.Sprintf("%s-%d.bc", digest, occurrences[digest])
-		occurrences[digest]++
-		return name, os.Rename(tmp.Name(), filepath.Join(work, name))
+		return fmt.Sprintf("%x", h.Sum(nil)), nil
 	}
 	return "", nil
 }
@@ -113,7 +110,7 @@ func thinCacheDir() string {
 	return filepath.Join(root, "tangollvm-thin")
 }
 
-func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) ([]string, error) {
+func (t *Tools) RunThinLTO(archives map[string]string, workers, memory int, budget uint) ([]string, error) {
 	if workers < 1 || memory < 1 {
 		return nil, fmt.Errorf("ThinLTO backend limits must be positive")
 	}
@@ -130,18 +127,25 @@ func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) 
 
 	var inputs []string
 	seen := make(map[string]bool)
-	occurrences := make(map[string]int)
-	for _, path := range archives {
+	bitcodeHashes := make(map[string]string)
+	// Walk package keys in order so aliases of the same archive pick one
+	// canonical key. The empty key identifies the command's archive.
+	for _, pkg := range slices.Sorted(maps.Keys(archives)) {
+		path := archives[pkg]
 		if seen[path] {
 			continue
 		}
 		seen[path] = true
-		module, err := thinSummary(path, work, occurrences)
+		// The planner orders imports by module name when applying its budget.
+		// Use package identity for that order and keep contents in the CAS key.
+		module := fmt.Sprintf("pkg-%x.bc", sha256.Sum256([]byte(pkg)))
+		hash, err := thinSummary(path, filepath.Join(work, module))
 		if err != nil {
 			return nil, fmt.Errorf("extract ThinLTO summary from %q: %w", path, err)
 		}
-		if module != "" {
+		if hash != "" {
 			inputs = append(inputs, module)
+			bitcodeHashes[module] = hash
 		}
 	}
 	if len(inputs) == 0 {
@@ -175,6 +179,9 @@ func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) 
 		"-import-all-index", "-go-specialization=false")
 	llcArgs := append(slices.Clone(target), "-filetype=obj", "-relocation-model=static",
 		"-O3", "-cost-kind=latency", "-tangollvm-lto=true")
+	// INT-19 (ALIGN1 c-loop64): ThinLTO backend default 64 B hot-loop
+	// alignment unless GOLLVMLLCCL overrides it or GOLLVM_DEFAULT_LOOP_ALIGN=0.
+	llcArgs = append(llcArgs, DefaultGoLoopAlignArgs()...)
 	cache := thinCacheDir()
 	var toolHashes []string
 	if cache != "" {
@@ -203,7 +210,7 @@ func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) 
 		wg.Go(func() {
 			for i := range jobs {
 				outputs[i] = filepath.Join(work, fmt.Sprintf("%d.o", i))
-				hits[i], errs[i] = local.compileThin(modules[i], optArgs, llcArgs, toolHashes, cache, outputs[i])
+				hits[i], errs[i] = local.compileThin(modules[i], bitcodeHashes, optArgs, llcArgs, toolHashes, cache, outputs[i])
 			}
 		})
 	}
@@ -227,15 +234,19 @@ func (t *Tools) RunThinLTO(archives []string, workers, memory int, budget uint) 
 	return outputs, nil
 }
 
-func (t *Tools) compileThin(m thinModule, optArgs, llcArgs, toolHashes []string, cache, output string) (bool, error) {
+func (t *Tools) compileThin(m thinModule, bitcodeHashes map[string]string, optArgs, llcArgs, toolHashes []string, cache, output string) (bool, error) {
 	var cached string
 	if cache != "" {
 		index, err := thinFileHash(filepath.Join(t.dir, m.Index))
 		if err != nil {
 			return false, err
 		}
-		// Module and source names incorporate the hashes of their contents.
-		key, err := json.Marshal([]any{"tango-thin-v1", m.Module, m.Sources, index, optArgs, llcArgs, toolHashes})
+		hashes := make([]string, 0, len(m.Sources)+1)
+		hashes = append(hashes, bitcodeHashes[m.Module])
+		for _, source := range m.Sources {
+			hashes = append(hashes, bitcodeHashes[source])
+		}
+		key, err := json.Marshal([]any{"tango-thin-v2", m.Module, m.Sources, hashes, index, optArgs, llcArgs, toolHashes})
 		if err != nil {
 			return false, err
 		}

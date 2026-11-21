@@ -105,8 +105,7 @@ func NewTargetMachine(config *Config) (TargetMachine, error) {
 	return machine, nil
 }
 
-// Just follow the info on wiki: https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels.
-// Some features are currently commented out due to various reasons.
+// GetLLVMFeatures returns the LLVM features allowed by GOAMD64 and the backend cap.
 func GetLLVMFeatures(amd64ver int) string {
 	var features []string
 
@@ -124,34 +123,13 @@ func GetLLVMFeatures(amd64ver int) string {
 	features = append(features, "+sse")
 	features = append(features, "+sse2")
 
-	// Add features for v2.
 	if buildcfg.GOAMD64 >= 2 && amd64ver >= 2 {
-		// Not found in an example CPU
-		//features = append(features, "+cmpxchg16b")
-		// Not found in an example CPU
-		//features = append(features, "+lahf")
-		features = append(features, "+popcnt")
-		// Not found in an example CPU
-		//features = append(features, "+sse3")
-		features = append(features, "+sse4.1")
-		features = append(features, "+sse4.2")
-		features = append(features, "+ssse3")
+		// LLVM represents the CRC32 instructions of SSE4.2 as a separate feature.
+		features = append(features, "+cx16", "+sahf", "+popcnt", "+sse4.1", "+sse4.2", "+ssse3", "+crc32")
 	}
-
-	// Add features for v3.
 	if buildcfg.GOAMD64 >= 3 && amd64ver >= 3 {
-		features = append(features, "+avx")
-		features = append(features, "+avx2")
-		// Not recognized in LLVM
-		//features = append(features, "+bmi1")
-		features = append(features, "+bmi2")
-		features = append(features, "+f16c")
-		features = append(features, "+fma")
-		// Not found in an example CPU
-		//features = append(features, "+lzcnt")
-		features = append(features, "+movbe")
-		// Not found in an example CPU
-		//features = append(features, "+osxsave")
+		// LLVM spells BMI1 "bmi". Go checks OSXSAVE and XCR0 before running v3 code.
+		features = append(features, "+avx", "+avx2", "+bmi", "+bmi2", "+f16c", "+fma", "+lzcnt", "+movbe", "+xsave")
 	}
 
 	// Add features for v4.

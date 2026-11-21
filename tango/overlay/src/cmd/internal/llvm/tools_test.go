@@ -9,6 +9,7 @@
 package llvm
 
 import (
+	"internal/buildcfg"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -160,5 +161,117 @@ done
 	content, err := os.ReadFile(steps[0])
 	if err != nil || string(content) != "llvm-link\nopt\n" {
 		t.Fatalf("pipeline continued after failure: %q, %v", content, err)
+	}
+}
+
+func TestGOAMD64Features(t *testing.T) {
+	target := buildcfg.GOAMD64
+	defer func() { buildcfg.GOAMD64 = target }()
+	for _, tc := range []struct{ target, cap, level int }{
+		{1, 3, 1}, {2, 3, 2}, {3, 3, 3}, {4, 3, 3}, {3, 1, 1}, {3, 2, 2}, {4, 4, 4},
+	} {
+		buildcfg.GOAMD64 = tc.target
+		features := "," + GetLLVMFeatures(tc.cap) + ","
+		for level, names := range map[int][]string{
+			1: {"sse2"},
+			2: {"popcnt", "sahf", "crc32", "sse4.2"},
+			3: {"avx", "avx2", "bmi", "bmi2", "f16c", "fma", "lzcnt", "movbe", "xsave"},
+			4: {"ermsb"},
+		} {
+			for _, name := range names {
+				if got := strings.Contains(features, ",+"+name+","); got != (tc.level >= level) {
+					t.Errorf("GOAMD64=v%d cap=%d: %s present=%t", tc.target, tc.cap, name, got)
+				}
+			}
+		}
+		if tc.level >= 2 && !strings.Contains(features, ",+cx16,") {
+			t.Errorf("GOAMD64=v%d cap=%d: missing cx16", tc.target, tc.cap)
+		}
+		if strings.Contains(features, "+avx512") {
+			t.Errorf("GOAMD64=v%d cap=%d: unexpected AVX-512 feature", tc.target, tc.cap)
+		}
+	}
+}
+
+func TestThinCacheTracksBitcodeContent(t *testing.T) {
+	work, cache := t.TempDir(), t.TempDir()
+	script := `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = -o ]; then
+		printf 'output\n' > "$2"
+		exit
+	fi
+	shift
+done
+exit 1
+`
+	for _, name := range []string{"opt", "llc"} {
+		if err := os.WriteFile(filepath.Join(work, name), []byte(script), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tools, err := NewTools(work, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools.SetDir(work)
+	module := thinModule{Module: "main.bc", Index: "main.index.bc", Sources: []string{"dependency.bc"}}
+	if err := os.WriteFile(filepath.Join(work, module.Index), []byte("index"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, local, source string
+		wantHit             bool
+	}{
+		{"initial", "local-1", "source-1", false},
+		{"unchanged", "local-1", "source-1", true},
+		{"import changed", "local-1", "source-2", false},
+		{"local changed", "local-2", "source-2", false},
+		{"reuse original", "local-1", "source-1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hashes := map[string]string{module.Module: tc.local, module.Sources[0]: tc.source}
+			output := filepath.Join(work, "main.o")
+			hit, err := tools.compileThin(module, hashes, nil, nil, nil, cache, output)
+			if err != nil || hit != tc.wantHit {
+				t.Fatalf("cache hit = %v, want %v (error %v)", hit, tc.wantHit, err)
+			}
+		})
+	}
+}
+
+func TestDefaultGoLoopAlignArgs(t *testing.T) {
+	want := []string{"-go-align-pgo-hot-loops", "-go-loop-align-bytes=64"}
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{name: "default c-loop64", want: want},
+		{name: "kill switch", env: map[string]string{"GOLLVM_DEFAULT_LOOP_ALIGN": "0"}},
+		{name: "explicit bytes override", env: map[string]string{"GOLLVMLLCCL": "-go-loop-align-bytes=32"}},
+		{name: "explicit bool disable", env: map[string]string{"GOLLVMLLCCL": "-go-align-pgo-hot-loops=0"}},
+		{name: "function knob override", env: map[string]string{"GOLLVMLLCCL": "-go-align-go-functions"}},
+		{name: "unrelated extra flags keep default",
+			env:  map[string]string{"GOLLVMLLCCL": "-some-other-llc-flag"},
+			want: want},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOLLVM_DEFAULT_LOOP_ALIGN", "")
+			t.Setenv("GOLLVMLLCCL", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			got := DefaultGoLoopAlignArgs()
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }

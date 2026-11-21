@@ -218,6 +218,16 @@ computeBitVector(const Function * Fn, uint64_t StackSize, bool requireFP,
         assert(Loc.Type == StackMaps::Location::Direct);
         i++;
 	for (; i < n && CSLocs[i].Type == StackMaps::Location::Constant; i++) {
+          // A 0xFEFEFEFE Constant is not a 32-bit pointer-bitmap word: it is
+          // the undef marker of a standalone GC/deopt operand (e.g. an
+          // extractvalue of an FCA field that is undef on this control flow
+          // after Sample PGO or cross-function optimization). It has no stack
+          // slot and contributes no bitmap bits, so it must not walk the
+          // aggregate slot index: treating it as a bitmap word underflows
+          // the locals index (or grows the args index) and trips
+          // BitVector::set. Just consume the location entry.
+          if (uint32_t(CSLocs[i].Offset) == GoUndefLocationMarker)
+            continue;
           if (Idx + 32 >= BV->size())
             BV->resize(Idx + 32);
           uint32_t Bits = CSLocs[i].Offset;

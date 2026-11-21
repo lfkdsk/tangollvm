@@ -22,8 +22,8 @@ cl::opt<bool> SkipSymbolization("skip-symbolization",
                                          "output file. It will show unwinder "
                                          "output for CS profile generation."));
 
-static cl::opt<bool> ShowMmapEvents("show-mmap-events",
-                                    cl::desc("Print binary load events."));
+cl::opt<bool> ShowMmapEvents("show-mmap-events",
+                            cl::desc("Print binary load events."));
 
 static cl::opt<bool>
     UseOffset("use-offset", cl::init(true),

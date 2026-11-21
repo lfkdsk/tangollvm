@@ -50,6 +50,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TangoLLVM/TangoLLVM.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <cassert>
 #include <cstddef>
@@ -332,6 +333,13 @@ void AggressiveDeadCodeElimination::initialize() {
 
 bool AggressiveDeadCodeElimination::isAlwaysLive(Instruction &I) {
   // TODO -- use llvm::isInstructionTriviallyDead
+  // A Go stack-object alloca must remain a frame slot: its
+  // go.stackobject.gcdata record describes GC pointers for the runtime stack
+  // copier, and deleting the alloca would drop that record.
+  if (auto *AI = dyn_cast<AllocaInst>(&I))
+    if (TangoLLVM::hasGoGC(*AI->getFunction()) &&
+        AI->hasMetadata("go.stackobject.gcdata"))
+      return true;
   if (I.isEHPad() || I.mayHaveSideEffects()) {
     // Skip any value profile instrumentation calls if they are
     // instrumenting constants.

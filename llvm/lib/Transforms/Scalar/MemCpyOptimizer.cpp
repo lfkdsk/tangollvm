@@ -923,9 +923,20 @@ bool MemCpyOptPass::performCallSlotOptzn(Instruction *cpyLoad,
     return false;
 
   // Lifetime marks shouldn't be operated on.
-  if (Function *F = C->getCalledFunction())
+  if (Function *F = C->getCalledFunction()) {
     if (F->isIntrinsic() && F->getIntrinsicID() == Intrinsic::lifetime_start)
       return false;
+
+    // llvm.go.preallocated's first operand is a Go frame-slot handle that must
+    // stay either null or the exact AllocaInst emitted by the frontend.
+    // GoStatepoints' legalizeTangoLLVMIR only knows how to eliminate a direct
+    // alloca operand; forwarding it to an arbitrary pointer (e.g. a field GEP
+    // of another alloca) would leave a non-null, non-alloca operand that reaches
+    // instruction selection and trips
+    // "all associated alloca must be eliminated before gc-statepoints".
+    if (F->getIntrinsicID() == Intrinsic::go_preallocated)
+      return false;
+  }
 
   if (C->getParent() != cpyStore->getParent()) {
     LLVM_DEBUG(dbgs() << "Call Slot: block local restriction\n");
@@ -1553,6 +1564,14 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,
                                           BatchAAResults &BAA) {
   LLVM_DEBUG(dbgs() << "Stack Move: Attempting to optimize:\n"
                     << *Store << "\n");
+
+  // The merge erases DestAlloca and drops unknown metadata on SrcAlloca,
+  // which would silently destroy the go.stackobject.gcdata records the
+  // runtime stack copier relies on. Keep both frame slots intact in Go.
+  if (TangoLLVM::hasGoGC(*DestAlloca->getFunction()) &&
+      (DestAlloca->hasMetadata("go.stackobject.gcdata") ||
+       SrcAlloca->hasMetadata("go.stackobject.gcdata")))
+    return false;
 
   // Make sure the two allocas are in the same address space.
   if (SrcAlloca->getAddressSpace() != DestAlloca->getAddressSpace()) {

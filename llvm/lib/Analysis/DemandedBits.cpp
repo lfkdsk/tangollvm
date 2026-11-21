@@ -40,6 +40,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TangoLLVM/TangoLLVM.h"
 #include <algorithm>
 #include <cstdint>
 
@@ -49,6 +50,13 @@ using namespace llvm::PatternMatch;
 #define DEBUG_TYPE "demanded-bits"
 
 static bool isAlwaysLive(Instruction *I) {
+  // A Go stack-object alloca must stay as one frame slot even when bit
+  // tracking finds no demanded integer users: erasing it drops the
+  // go.stackobject.gcdata record the runtime stack copier relies on.
+  if (auto *AI = dyn_cast<AllocaInst>(I))
+    if (TangoLLVM::hasGoGC(*AI->getFunction()) &&
+        AI->hasMetadata("go.stackobject.gcdata"))
+      return true;
   if (const IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
     if (II->getIntrinsicID() == Intrinsic::go_metadata) {
       return true;

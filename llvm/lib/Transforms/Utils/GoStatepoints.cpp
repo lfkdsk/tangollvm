@@ -2573,7 +2573,7 @@ static void analyzeNonNullGep(Function &F, DenseSet<Value*> &NNGeps) {
 }
 
 static void analyzeDereferenceableGeps(DenseSet<GetElementPtrInst*> &NonDerefGEPs,
-                                       DenseSet<GetElementPtrInst*> &GEPs,
+                                       SetVector<GetElementPtrInst*> &GEPs,
                                        Function &F,
                                        DominatorTree &DT,
                                        const TargetLibraryInfo &TLI) {
@@ -2615,16 +2615,23 @@ template<typename K, typename V, unsigned DefaultBuckets = 8>
 using GoSmallMap = llvm::SmallDenseMap<K, V, DefaultBuckets>;
 
 struct GEPUsages {
-  // first usage
-  GoSmallSet<Instruction*> FirstUsages;
+  // First usage. Use SetVector instead of a pointer-keyed DenseSet: the
+  // re-hoist walk below iterates this collection while cloning/inserting
+  // GEPs, so DenseSet (pointer-hash) iteration order made the order of
+  // inserted instructions, and in turn the generated code, depend on
+  // allocator addresses. Insertion order follows the deterministic
+  // function/basic-block walk in analyzeGepUsages.
+  SetVector<Instruction*> FirstUsages;
   // first usage -> id
   GoSmallMap<Instruction*, unsigned> FUIds;
   // id -> first usage, only for query
   GoSmallMap<unsigned, Instruction*> Id2Fu;
   // the ids of first usages that through stack map
   GoSmallSet<unsigned> UnsafeIds;
-  // the following usages of a first usage, the key is the id of the first usage
-  GoSmallMap<unsigned, GoSmallSet<Instruction*>> Children;
+  // the following usages of a first usage, the key is the id of the first
+  // usage. Insertion-ordered for the same reason as FirstUsages: iteration
+  // drives use rewrites whose observable order must stay deterministic.
+  GoSmallMap<unsigned, SetVector<Instruction*>> Children;
   // for phi, record the incoming basic block and the id of the incoming value
   GoSmallMap<Instruction*, GoSmallMap<BasicBlock*, unsigned>> PhiFUIds;
   // for phi, record the id to the index of the incoming value
@@ -2664,8 +2671,8 @@ public:
       OS << "ReHoist start: " << F.getName() << "\n";
   }
 
-  void printCandidates(const DenseSet<GetElementPtrInst *> &GEPs,
-                       const DenseSet<GetElementPtrInst *> &Candidates) {
+  void printCandidates(const SetVector<GetElementPtrInst *> &GEPs,
+                       const SetVector<GetElementPtrInst *> &Candidates) {
     if (!Debug)
       return;
     F.print(OS);
@@ -3031,7 +3038,9 @@ static bool reHoistGEP(DominatorTree &DT, LoopInfo &LI, Function &F,
   if (!RehoistGEP)
     return false;
 
-  DenseSet<GetElementPtrInst*> GEPs;
+  // Program-order collection: later walks iterate these to clone GEPs, so
+  // their order must not depend on pointer-hash bucket layout (DET4).
+  SetVector<GetElementPtrInst*> GEPs;
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(&I))
@@ -3052,7 +3061,9 @@ static bool reHoistGEP(DominatorTree &DT, LoopInfo &LI, Function &F,
   DenseSet<GetElementPtrInst*> NonDerefGEPs;
   analyzeDereferenceableGeps(NonDerefGEPs, GEPs, F, DT, TLI);
 
-  DenseSet<GetElementPtrInst*> ToMove;
+  // Insertion order mirrors the program-order GEPs walk above, keeping
+  // downstream analysis and IR dumps deterministic.
+  SetVector<GetElementPtrInst*> ToMove;
   for (GetElementPtrInst *GEP : GEPs) {
     if (!NNGeps.contains(GEP) || NonDerefGEPs.contains(GEP))
       ToMove.insert(GEP);

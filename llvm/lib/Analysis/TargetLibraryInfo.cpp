@@ -183,6 +183,13 @@ static void initializeBase(TargetLibraryInfoImpl &TLI, const Triple &T) {
 /// triple gets a sane set of defaults.
 static void initializeLibCalls(TargetLibraryInfoImpl &TLI, const Triple &T,
                                ArrayRef<StringLiteral> StandardNames) {
+  // Go objects use the Go runtime ABI and cannot resolve C library calls
+  // synthesized by optimizations such as MergeICmps.
+  if (T.isGoEnvironment()) {
+    TLI.disableAllFunctions();
+    return;
+  }
+
   // Set IO unlocked variants as unavailable
   // Set them as available per system below
   TLI.setUnavailable(LibFunc_getc_unlocked);
