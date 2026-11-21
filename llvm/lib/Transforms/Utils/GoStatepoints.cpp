@@ -513,7 +513,14 @@ getPtrBitmapForType(Type *T, const DataLayout &DL,
   unsigned last = BV.find_last();
   if (last == 0) // a single pointer field, no need of a bitmap
     return;
-  //Words.reserve(last/32 + 1);
+  // The header gives the number of bitmap words that follow, so that the
+  // stack map printer can delimit them (see TangoLLVM::getGoPtrBitmapHeader).
+  unsigned NumWords = last / 32 + 1;
+  if (NumWords > TangoLLVM::GoPtrBitmapHeaderCountMask)
+    report_fatal_error("Go statepoint: pointer bitmap of a stack slot is too "
+                       "large for its header");
+  Words.push_back(ConstantInt::get(
+      Int32Ty, TangoLLVM::getGoPtrBitmapHeader(NumWords)));
   for (unsigned i = 0; i <= last; i += 32) {
     uint32_t w = 0;
     for (unsigned j = 0; j < 32 && i+j <= last; j++)

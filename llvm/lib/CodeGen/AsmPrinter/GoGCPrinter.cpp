@@ -35,6 +35,8 @@
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/TangoLLVM/TangoLLVM.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
@@ -43,10 +45,6 @@
 using namespace llvm;
 
 static cl::opt<bool> GoGCStats("go-gc-stats", cl::Hidden, cl::init(false));
-
-// StatepointLowering and StackMaps serialize an undef deopt/GC value as this
-// constant so that stack map consumers can recognize it.
-constexpr uint32_t GoUndefLocationMarker = 0xFEFEFEFE;
 
 namespace {
 
@@ -122,11 +120,38 @@ computeBitVector(const Function * Fn, uint64_t StackSize, bool requireFP,
       assert(Loc.Offset >= 0 && "replace FP to SP");
       assert(Loc.Offset % PtrSize == 0 && "must be ptr");
 
+      // An aggregate stack slot is a Direct location followed by a pointer
+      // bitmap header and exactly the number of 32-bit bitmap words the
+      // header gives (see TangoLLVM::getGoPtrBitmapHeader). Any other
+      // Constant after a location is a separate operand, in practice the
+      // 0xFEFEFEFE marker StackMaps emits for an undef operand; it is skipped
+      // by the default case below and says nothing about this location,
+      // which is recorded as a single pointer (or a vector spill).
+      unsigned NumBitmapWords = 0;
+      if (i + 1 < n && CSLocs[i + 1].Type == StackMaps::Location::Constant &&
+          TangoLLVM::isGoPtrBitmapHeader(uint32_t(CSLocs[i + 1].Offset))) {
+        if (Loc.Type != StackMaps::Location::Direct)
+          report_fatal_error(Twine("Go stack map of ") + Fn->getName() +
+                             ": pointer bitmap header after a location that "
+                             "is not a stack slot");
+        NumBitmapWords = uint32_t(CSLocs[i + 1].Offset) &
+                         TangoLLVM::GoPtrBitmapHeaderCountMask;
+        if (i + 1 + NumBitmapWords >= n)
+          report_fatal_error(Twine("Go stack map of ") + Fn->getName() +
+                             ": truncated pointer bitmap");
+        for (unsigned W = 0; W < NumBitmapWords; ++W)
+          if (CSLocs[i + 2 + W].Type != StackMaps::Location::Constant)
+            report_fatal_error(Twine("Go stack map of ") + Fn->getName() +
+                               ": pointer bitmap word is not a constant");
+      }
+
       int64_t LocIdx = Loc.Offset / PtrSize;
       if (LocIdx >= LocationSeen.size()) {
         LocationSeen.resize(LocIdx + 1);
       }
-      if (LocationSeen.test(LocIdx)) {
+      // Setting bits is idempotent, so an aggregate seen before is processed
+      // again instead of skipped: its words have to be consumed in any case.
+      if (LocationSeen.test(LocIdx) && !NumBitmapWords) {
         continue;
       }
       LocationSeen.set(LocIdx);
@@ -179,63 +204,26 @@ computeBitVector(const Function * Fn, uint64_t StackSize, bool requireFP,
       if (IsLocal)
         LocalsSize = std::max(LocalsSize, Idx + 1);
 
-      // If a slot is following a "Constant" location, it is an aggregate type
-      // and that constant encodes the pointer bitmap.
-      if (i+1 < n &&
-          CSLocs[i+1].Type == StackMaps::Location::Constant) {
-        if (Loc.Type != StackMaps::Location::Direct) {
-          // See StackMaps.cpp for Undef Register
-          assert((uint32_t(CSLocs[i+1].Offset) == GoUndefLocationMarker) &&
-                 "invariant");
-          continue;
-        }
-        // A standalone undef pointer operand is serialized as the undef
-        // marker constant, even when the preceding value lives in a Direct
-        // stack slot. Full LTO can leave an extracted aggregate field undef
-        // on some control flow (e.g. an FCA returned by a PHI), so a run of
-        // markers can follow an ordinary single-pointer slot. Such a run is
-        // not an aggregate pointer bitmap: treating it as local bitmap words
-        // underflows the locals slot index below. Record the head slot as a
-        // single pointer and let the markers fall through as ignored
-        // standalone constants.
-        if (Loc.Type == StackMaps::Location::Direct &&
-            uint32_t(CSLocs[i+1].Offset) == GoUndefLocationMarker) {
-          bool AllUndefMarkers = true;
-          for (unsigned k = i + 1;
-               k < n && CSLocs[k].Type == StackMaps::Location::Constant; ++k)
-            if (uint32_t(CSLocs[k].Offset) != GoUndefLocationMarker) {
-              AllUndefMarkers = false;
-              break;
-            }
-          if (AllUndefMarkers) {
-            if (Idx >= BV->size())
-              BV->resize(Idx + 1);
-            BV->set(Idx);
-            continue;
+      if (NumBitmapWords) {
+        // Bit J of word K marks slot word 32*K+J of the aggregate. Local slot
+        // indices count down from the head slot, argument indices count up.
+        int64_t Base = Idx;
+        for (unsigned W = 0; W < NumBitmapWords;
+             ++W, Base += IsLocal ? -32 : 32) {
+          uint32_t Bits = uint32_t(CSLocs[i + 2 + W].Offset);
+          if (Base + 32 >= int64_t(BV->size()))
+            BV->resize(Base + 32);
+          for (unsigned j = 0; j < 32; j++) {
+            if (!((Bits >> j) & 1))
+              continue;
+            int64_t Slot = IsLocal ? Base - j : Base + j;
+            if (Slot < 0)
+              report_fatal_error(Twine("Go stack map of ") + Fn->getName() +
+                                 ": pointer bitmap extends below the frame");
+            BV->set(Slot);
           }
         }
-        // Make sure it is a local/arg slot, not a spill of in-register value.
-        assert(Loc.Type == StackMaps::Location::Direct);
-        i++;
-	for (; i < n && CSLocs[i].Type == StackMaps::Location::Constant; i++) {
-          if (Idx + 32 >= BV->size())
-            BV->resize(Idx + 32);
-          uint32_t Bits = CSLocs[i].Offset;
-          // dbgs() << "ArgBits: " << Bits << "\n";
-          for (unsigned j = 0; j < 32; j++)
-            if ((Bits>>j)&1) {
-              if (IsLocal) {
-                // dbgs() << "Local Set: " << Idx << " - " << j << "\n";
-                assert(Idx >= j && "stack grows down");
-                BV->set(Idx - j);
-              } else {
-                // dbgs() << "Args Set: " << Idx << " + " << j << "\n";
-                BV->set(Idx + j);
-              }
-            }
-          Idx += IsLocal ? -32 : 32;
-        }
-        i--; // compensate the increment in outer loop
+        i += 1 + NumBitmapWords; // the header and the words
         break;
       }
 

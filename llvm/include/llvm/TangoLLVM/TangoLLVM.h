@@ -67,6 +67,31 @@ enum class GoAdHocABI {
 class TangoLLVM {
 
 public:
+  // Statepoint deopt operands describe a live aggregate stack slot (an alloca
+  // or Go preallocated area with a pointer beyond its first word) as
+  //
+  //   ptr <slot>, i32 getGoPtrBitmapHeader(N), i32 <word 0>, ..., i32 <word N-1>
+  //
+  // where bit J of word K says whether slot word 32*K+J holds a pointer.
+  // StackMaps lowers these i32 operands, and also every undef deopt operand
+  // (the 0xFEFEFEFE marker), to Constant locations. The header tells the Go
+  // stack map printer how many of the Constants after the slot are bitmap
+  // words: without it a bitmap word equal to 0xFEFEFEFE could not be told
+  // apart from an undef marker, nor an undef marker after the last word from
+  // one more word. The tag cannot be an undef marker and never follows any
+  // location other than the slot it describes.
+  static constexpr uint32_t GoPtrBitmapHeaderTag = 0x60B10000;
+  static constexpr uint32_t GoPtrBitmapHeaderCountMask = 0x0000FFFF;
+
+  static constexpr uint32_t getGoPtrBitmapHeader(uint32_t NumWords) {
+    return GoPtrBitmapHeaderTag | NumWords;
+  }
+
+  static constexpr bool isGoPtrBitmapHeader(uint32_t V) {
+    return (V & ~GoPtrBitmapHeaderCountMask) == GoPtrBitmapHeaderTag &&
+           (V & GoPtrBitmapHeaderCountMask) != 0;
+  }
+
   // Function-level metadata holding the DISubprogram names of go.allunsafe
   // callees that were inlined into a function which is not itself
   // runtime/nosplit. Instead of propagating the callee's whole-function
