@@ -40,6 +40,36 @@ addModuleFlags(Module &M,
     Nodes.push_back(MDNode::get(Context, Vals));
   }
 
+  // TangoLLVM: full LTO runs the combined `default<O3>,lto<O3>` pipeline in one
+  // opt invocation, and both pipeline builders finish with a CGProfilePass.
+  // Unlike IRMover (which merges module flags across modules),
+  // Module::addModuleFlag appends unconditionally, so a second Append flag with
+  // the same ID trips the verifier ("module flag identifiers must be unique").
+  // Reuse the existing "CG Profile" flag and extend its tuple instead. Edges
+  // whose functions were optimized away become null entries and are skipped by
+  // the CG profile emitter, exactly like post-DCE edges in a single run.
+  NamedMDNode *ModFlags = M.getModuleFlagsMetadata();
+  if (ModFlags) {
+    for (unsigned I = 0, E = ModFlags->getNumOperands(); I != E; ++I) {
+      MDNode *Flag = ModFlags->getOperand(I);
+      if (Flag->getNumOperands() != 3 ||
+          !mdconst::hasa<ConstantInt>(Flag->getOperand(0)) ||
+          !isa<MDString>(Flag->getOperand(1)))
+        continue;
+      if (cast<MDString>(Flag->getOperand(1))->getString() != "CG Profile")
+        continue;
+      auto *Old = dyn_cast<MDTuple>(Flag->getOperand(2));
+      if (!Old)
+        continue;
+      std::vector<Metadata *> Merged;
+      Merged.reserve(Old->getNumOperands() + Nodes.size());
+      Merged.assign(Old->op_begin(), Old->op_end());
+      Merged.insert(Merged.end(), Nodes.begin(), Nodes.end());
+      Flag->replaceOperandWith(2, MDTuple::getDistinct(Context, Merged));
+      return true;
+    }
+  }
+
   M.addModuleFlag(Module::Append, "CG Profile",
                   MDTuple::getDistinct(Context, Nodes));
   return true;
