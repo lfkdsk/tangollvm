@@ -5609,6 +5609,18 @@ std::pair<bool /*Changed*/, bool /*CFGChanged*/> SROA::runSROA(Function &F) {
       if (TangoLLVM::hasGoGC(F) && dontSROA(AI))
         continue;
 
+      // A Go stack object carries the frontend-computed frame layout in
+      // "go.stackobject.gcdata". The runtime stack copier resolves interior
+      // stack pointers through this exact record, so the alloca must survive
+      // optimization as a single frame slot. SROA promotion/splitting would
+      // either delete the alloca (mem2reg) or replace it with partitions,
+      // dropping the metadata and emitting a synthetic record at a different
+      // frame offset. Keep these allocas intact, matching the per-package
+      // (non-LTO) compilation path where they are never promoted.
+      if (TangoLLVM::hasGoGC(F) &&
+          AI->hasMetadata("go.stackobject.gcdata"))
+        continue;
+
       if (DL.getTypeAllocSize(AI->getAllocatedType()).isScalable() &&
           isAllocaPromotable(AI))
         PromotableAllocas.push_back(AI);
