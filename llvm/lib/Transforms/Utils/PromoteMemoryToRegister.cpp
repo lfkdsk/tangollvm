@@ -45,6 +45,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/User.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/TangoLLVM/TangoLLVM.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <algorithm>
@@ -63,6 +64,12 @@ STATISTIC(NumDeadAlloca,    "Number of dead alloca's removed");
 STATISTIC(NumPHIInsert,     "Number of PHI nodes inserted");
 
 bool llvm::isAllocaPromotable(const AllocaInst *AI) {
+  // A Go stack object must stay a single frame slot: the runtime resolves
+  // interior pointers through the go.stackobject.gcdata record, so mem2reg
+  // must not promote the alloca to SSA and drop the record.
+  if (TangoLLVM::hasGoGC(*AI->getFunction()) &&
+      AI->hasMetadata("go.stackobject.gcdata"))
+    return false;
   // Only allow direct and non-volatile loads and stores...
   for (const User *U : AI->users()) {
     if (const LoadInst *LI = dyn_cast<LoadInst>(U)) {

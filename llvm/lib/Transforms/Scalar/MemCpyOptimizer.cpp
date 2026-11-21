@@ -1554,6 +1554,14 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,
   LLVM_DEBUG(dbgs() << "Stack Move: Attempting to optimize:\n"
                     << *Store << "\n");
 
+  // The merge erases DestAlloca and drops unknown metadata on SrcAlloca,
+  // which would silently destroy the go.stackobject.gcdata records the
+  // runtime stack copier relies on. Keep both frame slots intact in Go.
+  if (TangoLLVM::hasGoGC(*DestAlloca->getFunction()) &&
+      (DestAlloca->hasMetadata("go.stackobject.gcdata") ||
+       SrcAlloca->hasMetadata("go.stackobject.gcdata")))
+    return false;
+
   // Make sure the two allocas are in the same address space.
   if (SrcAlloca->getAddressSpace() != DestAlloca->getAddressSpace()) {
     LLVM_DEBUG(dbgs() << "Stack Move: Address space mismatch\n");

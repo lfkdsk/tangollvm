@@ -77,6 +77,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TangoLLVM/TangoLLVM.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <algorithm>
@@ -438,6 +439,14 @@ bool llvm::wouldInstructionBeTriviallyDead(const Instruction *I,
       return false;
     return true;
   }
+
+  // A Go stack-object alloca must survive even when all its users have been
+  // folded away: erasing it would drop the go.stackobject.gcdata record and
+  // leave the runtime stack copier without the frame slot description.
+  if (const auto *AI = dyn_cast<AllocaInst>(I))
+    if (TangoLLVM::hasGoGC(*AI->getFunction()) &&
+        AI->hasMetadata("go.stackobject.gcdata"))
+      return false;
 
   if (auto *CB = dyn_cast<CallBase>(I))
     if (isRemovableAlloc(CB, TLI))

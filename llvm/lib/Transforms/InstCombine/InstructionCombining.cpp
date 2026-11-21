@@ -3115,6 +3115,15 @@ static bool isRemovableWrite(CallBase &CB, Value *UsedV,
 static bool isAllocSiteRemovable(Instruction *AI,
                                  SmallVectorImpl<WeakTrackingVH> &Users,
                                  const TargetLibraryInfo &TLI) {
+  // InstCombine removes "removable" allocas by forwarding their stores and
+  // deleting the slot. A Go stack object must survive as one frame slot,
+  // otherwise its go.stackobject.gcdata record is lost and the runtime stack
+  // copier can no longer resolve interior pointers.
+  if (auto *Alloca = dyn_cast<AllocaInst>(AI))
+    if (TangoLLVM::hasGoGC(*Alloca->getFunction()) &&
+        Alloca->hasMetadata("go.stackobject.gcdata"))
+      return false;
+
   SmallVector<Instruction*, 4> Worklist;
   const std::optional<StringRef> Family = getAllocationFamily(AI, &TLI);
   Worklist.push_back(AI);
